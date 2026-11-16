@@ -1,5 +1,5 @@
 <script lang="ts">
-  // `-webkit-app-region: drag` drags the window; `--window-control` gives each button its OS behaviour
+  // `window-drag: move` drags the window; `--window-control` gives each button its OS behaviour
   // (snap layouts on maximize).
   import { appWindow } from "@skathi-native/runtime";
   import { onMount } from "svelte";
@@ -60,7 +60,7 @@
     flex-shrink: 0;
     display: flex;
     align-items: center;
-    -webkit-app-region: drag;
+    window-drag: move;
     user-select: none;
   }
   @media (display-mode: fullscreen) {
@@ -93,7 +93,7 @@
   .controls {
     height: 100%;
     display: flex;
-    -webkit-app-region: no-drag;
+    window-drag: none;
   }
   .control {
     width: 46px;
