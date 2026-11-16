@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { clock } from "../format";
-import { mapTile, RADAR_MAX_ZOOM, radarTile, tilesAround, worldPixel } from "../radar";
+import { mapTile, RADAR_MAX_ZOOM, radarTile, TILE, tilesAround, worldPixel } from "../radar";
 import { weather } from "../scene";
 import { app } from "../state";
 import Glass from "./Glass.vue";
@@ -30,13 +30,12 @@ const sheet = computed(() => {
   if (!width || !height) return null;
   return tilesAround(worldPixel(app.place.latitude, app.place.longitude, zoom.value), width, height, zoom.value);
 });
-// The tiles are laid out in flow, in a grid moved by its margins: an effect that reads its
-// element's painting (`[SkContent]`) gets the in-flow subtree, not positioned descendants.
-const sheetStyle = computed(() => ({
-  width: `${(sheet.value?.columns ?? 0) * 256}px`,
-  marginLeft: `${sheet.value?.left ?? 0}px`,
-  marginTop: `${sheet.value?.top ?? 0}px`,
-}));
+const sheetStyle = computed(() => ({ left: `${sheet.value?.left ?? 0}px`, top: `${sheet.value?.top ?? 0}px` }));
+const columns = computed(() => sheet.value?.columns ?? 1);
+const place = (i: number) => ({
+  left: `${(i % columns.value) * TILE}px`,
+  top: `${Math.floor(i / columns.value) * TILE}px`,
+});
 // RainViewer allows 100 requests a minute from one address, so playback shows as many evenly spaced
 // frames as about 80 tiles allow, ending with the latest, and loads each only when it is reached.
 const frames = computed(() => {
@@ -118,7 +117,14 @@ const open = (url: string) => window.open(url);
     <div ref="view" class="map">
       <div class="base">
         <div v-if="sheet" class="sheet" :style="sheetStyle">
-          <img v-for="t in sheet.tiles" :key="t.key" class="tile" :src="mapTile(t, zoom)" alt="" />
+          <img
+            v-for="(t, n) in sheet.tiles"
+            :key="t.key"
+            class="tile"
+            :style="place(n)"
+            :src="mapTile(t, zoom)"
+            alt=""
+          />
         </div>
       </div>
       <div class="rain" :style="{ '--shading': rain }">
@@ -126,9 +132,10 @@ const open = (url: string) => window.open(url);
           <template v-for="(f, i) in frames" :key="f.path">
             <div v-if="loaded(i)" v-show="i === frame" class="sheet" :style="sheetStyle">
               <img
-                v-for="t in sheet.tiles"
+                v-for="(t, n) in sheet.tiles"
                 :key="t.key"
                 class="tile"
+                :style="place(n)"
                 :src="radarTile(app.radar, f, t, zoom)"
                 alt=""
                 @error="broken(i)"
@@ -192,8 +199,6 @@ const open = (url: string) => window.open(url);
   top: 0;
   right: 0;
   bottom: 0;
-  display: flex;
-  align-items: flex-start;
   overflow: hidden;
 }
 .base {
@@ -203,14 +208,12 @@ const open = (url: string) => window.open(url);
   transition: --shading 250ms linear;
 }
 .sheet {
-  display: flex;
-  flex-wrap: wrap;
-  flex-shrink: 0;
+  position: absolute;
 }
 .tile {
+  position: absolute;
   width: 256px;
   height: 256px;
-  flex-shrink: 0;
 }
 .you {
   position: absolute;
