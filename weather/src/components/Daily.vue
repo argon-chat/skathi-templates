@@ -71,4 +71,9 @@ const days = computed(() => {
   font-size: 17px;
   color: #ffffff99;
 }
+@media (max-height: 880px) {
+  .day {
+    height: 40px;
+  }
+}
 </style>

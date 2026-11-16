@@ -66,4 +66,12 @@ const hours = computed(() => {
   font-size: 19px;
   color: #ffffff;
 }
+@media (max-height: 880px) {
+  .hourly {
+    padding: 8px 14px;
+  }
+  .hour {
+    padding: 8px 0 10px;
+  }
+}
 </style>

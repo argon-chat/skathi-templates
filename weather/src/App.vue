@@ -29,7 +29,7 @@ onUnmounted(() => stop());
       <main class="main">
         <template v-if="app.view === 'now'">
           <div class="left">
-            <Hero class="grow" />
+            <Hero />
             <Hourly />
             <Daily />
           </div>

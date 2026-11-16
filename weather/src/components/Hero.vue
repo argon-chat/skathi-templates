@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { labelOf } from "../conditions";
 import { ago, degrees } from "../format";
 import { weather } from "../scene";
@@ -8,6 +8,10 @@ import Icon from "./Icon.vue";
 import WeatherIcon from "./WeatherIcon.vue";
 
 const menu = ref(false);
+const height = ref(window.innerHeight);
+const resize = () => (height.value = window.innerHeight);
+onMounted(() => window.addEventListener("resize", resize));
+onUnmounted(() => window.removeEventListener("resize", resize));
 const f = computed(() => app.forecast);
 const today = computed(() => f.value?.days[0]);
 const label = computed(() => labelOf(weather.value.code, weather.value.isDay));
@@ -50,7 +54,7 @@ function search() {
     <div v-if="f" class="reading">
       <div class="temp-row">
         <span class="temp">{{ deg(f.now.temperature) }}</span>
-        <WeatherIcon class="big-icon" :code="weather.code" :night="!weather.isDay" :size="124" />
+        <WeatherIcon class="big-icon" :code="weather.code" :night="!weather.isDay" :size="height > 880 ? 124 : 92" />
       </div>
       <div class="condition">{{ label }}</div>
       <div class="meta">
@@ -67,6 +71,7 @@ function search() {
 <style scoped>
 .hero {
   position: relative;
+  flex: 1 0 auto;
   display: flex;
   flex-direction: column;
   gap: 16px;
@@ -194,5 +199,20 @@ function search() {
 }
 .gap {
   width: 6px;
+}
+@media (max-height: 880px) {
+  .hero {
+    gap: 8px;
+  }
+  .temp {
+    font-size: 96px;
+    line-height: 92px;
+  }
+  .condition {
+    font-size: 28px;
+  }
+  .meta {
+    font-size: 15px;
+  }
 }
 </style>
