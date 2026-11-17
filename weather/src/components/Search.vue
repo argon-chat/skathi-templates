@@ -83,7 +83,7 @@ onUnmounted(() => {
 }
 .search {
   width: 520px;
-  height: fit-content;
+  align-self: flex-start;
   display: flex;
   flex-direction: column;
   padding: 10px;
