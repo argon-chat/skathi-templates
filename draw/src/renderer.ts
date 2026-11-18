@@ -246,6 +246,8 @@ export class Renderer {
   private pageBuffer: GPUBuffer | null = null;
   private pageBytes: Uint8Array<ArrayBuffer> | null = null;
   private singleTarget: GPUTexture | null = null;
+  private singleView: GPUTextureView | null = null;
+  private readonly layerGroups = new WeakMap<GPUTextureView, WeakMap<GPUBuffer, GPUBindGroup>>();
   private readonly maxGeometry = GPU_CACHE_BYTES;
   private readonly rasters = new WeakMap<Uint8Array, RasterBinding>();
   private readonly loads = new Set<Promise<void>>();
@@ -312,7 +314,7 @@ export class Renderer {
     for (const layer of layers) {
       let gpu = this.layers.get(layer.id);
       if (!gpu) this.layers.set(layer.id, (gpu = new LayerGpu(this.uniformBuffer(16))));
-      const limit = Math.min(192 * 1024 * 1024, Math.floor(this.maxGeometry / Math.max(1, layers.length)));
+      const limit = Math.floor((this.maxGeometry - (this.float?.gpu.limit ?? 0)) / Math.max(1, layers.length));
       if (gpu.limit !== limit) {
         gpu.limit = limit;
         gpu.source = null;
@@ -378,6 +380,7 @@ export class Renderer {
     this.blend = null;
     this.singleTarget?.destroy();
     this.singleTarget = null;
+    this.singleView = null;
     this.width = w;
     this.height = h;
     this.dpr = dpr;
@@ -509,6 +512,7 @@ export class Renderer {
     if (this.float?.layer !== layer || this.float.strokes !== strokes) {
       this.dropFloat();
       const gpu = new LayerGpu(this.uniformBuffer(16));
+      gpu.limit = Math.min(32 * 1024 * 1024, Math.floor(this.maxGeometry / 4));
       this.float = { layer, strokes, hidden: new Set(strokes), gpu };
       this.sync(gpu, strokes);
       this.setLayers(this.order);
@@ -903,6 +907,8 @@ export class Renderer {
   }
 
   destroy() {
+    this.msaa = null;
+    this.depth = null;
     for (const gpu of this.layers.values()) gpu.destroy();
     for (const texture of this.owned) texture.destroy();
     this.endLive();
@@ -997,7 +1003,7 @@ export class Renderer {
           format: LAYER_FORMAT,
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
         });
-        shared = this.singleTarget.createView();
+        shared = this.singleView ??= this.singleTarget.createView();
       }
       for (const l of this.order) {
         const gpu = this.layers.get(l.id);
@@ -1426,13 +1432,22 @@ export class Renderer {
   }
 
   private layerGroup(view: GPUTextureView, opacity: GPUBuffer): GPUBindGroup {
-    return this.device.createBindGroup({
+    let groups = this.layerGroups.get(view);
+    if (!groups) {
+      groups = new WeakMap();
+      this.layerGroups.set(view, groups);
+    }
+    const found = groups.get(opacity);
+    if (found) return found;
+    const group = this.device.createBindGroup({
       layout: this.textureLayout,
       entries: [
         { binding: 0, resource: view },
         { binding: 1, resource: { buffer: opacity } },
       ],
     });
+    groups.set(opacity, group);
+    return group;
   }
 
   private target(w: number, h: number, gpu: LayerGpu): Target {

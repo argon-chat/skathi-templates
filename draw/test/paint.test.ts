@@ -1,8 +1,8 @@
 import { expect, test } from "bun:test";
 import { floodContours } from "../src/bucket";
 import { insidePolygon, transformStroke, translate } from "../src/geometry";
-import { LiveStroke, Mesh, tessellate } from "../src/ink";
-import type { Stroke } from "../src/model";
+import { estimateStrokeVertices, LiveStroke, Mesh, tessellate } from "../src/ink";
+import { TOOLS, type Stroke } from "../src/model";
 import { dabStream, polygonMesh, type Dab } from "../src/pigments";
 import { SmudgeSession, drawingPixels } from "../src/smudge";
 
@@ -97,6 +97,20 @@ test("even-odd triangulation accounts for a self crossing and a hole", () => {
       [2, 2, 8, 2, 8, 8, 2, 8],
     ]),
   ).toBe(64);
+});
+
+test("imported stroke estimates bound curved ribbons, sharp turns, particles and self-crossing fills", () => {
+  const points: number[] = [];
+  let seed = 39;
+  const random = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  for (let i = 0; i < 30; i++) points.push(random() * 40, random() * 40, random(), 35, 61, 0, i * 19);
+  for (const tool of TOOLS)
+    for (const shape of [true, false]) {
+      const s = { ...stroke(tool), width: 17, points, shape };
+      const mesh = new Mesh();
+      tessellate(s, mesh);
+      expect(estimateStrokeVertices(s, 300000)).toBeGreaterThanOrEqual(mesh.count);
+    }
 });
 
 test("the smudge updates only the new prefix, crops its result and renders as one transformed quad", () => {
