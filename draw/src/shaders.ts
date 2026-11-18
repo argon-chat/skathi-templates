@@ -45,26 +45,32 @@ struct Ink {
   @location(4) doc: vec2f,
   @location(5) @interpolate(flat) depth: f32,
   @location(6) along: vec2f,
+  @location(7) @interpolate(flat) phase: f32,
 }
 
-@vertex fn vs(
-  @location(0) p: vec2f,
-  @location(1) attr: vec4f,
-  @location(2) color: vec4f,
-  @location(3) depth: f32,
-  @location(4) along: vec2f,
-) -> Ink {
+fn ink_vertex(p:vec2f,attr:vec4f,color:vec4f,depth:f32,along:vec2f)-> Ink {
   var o: Ink;
   let q = vec2f(model.m.x * p.x + model.m.z * p.y, model.m.y * p.x + model.m.w * p.y) + model.t.xy;
   o.pos = clip(to_screen(q));
   o.edge = attr.x;
   o.density = attr.y;
   o.shade = attr.z;
-  o.color = select(color, vec4f(view.ink.rgb, color.a), attr.w > 0.5);
+  o.color = select(color, vec4f(view.ink.rgb, color.a), attr.w > 0.0);
+  o.phase=abs(round(attr.w*127.0))-select(0.0,1.0,attr.w>0.0);
   o.doc = q;
   o.depth = depth;
   o.along = along;
   return o;
+}
+
+@vertex fn vs(@location(0) p:vec2f,@location(1) attr:vec4f,@location(2) color:vec4f,@location(3) depth:f32,@location(4) along:vec2f)->Ink {
+  return ink_vertex(p,attr,color,depth,along);
+}
+
+@vertex fn vs_dab(@builtin(vertex_index) vertex:u32,@location(0) center:vec2f,@location(1) attr:vec4f,@location(2) color:vec4f,@location(3) depth:f32,@location(4) size:vec2f)->Ink {
+  var corners=array(vec2f(-1,-1),vec2f(1,-1),vec2f(-1,1),vec2f(-1,1),vec2f(1,-1),vec2f(1,1));
+  let corner=corners[vertex];
+  return ink_vertex(center+corner*size.x,attr,color,depth,corner);
 }
 
 fn coverage(edge: f32) -> f32 {
@@ -96,6 +102,17 @@ fn eraser(i: Ink) -> vec4f {
 
 @fragment fn fs_pen(i: Ink) -> @location(0) vec4f {
   return pen(i);
+}
+
+@fragment fn fs_spray(i:Ink)->@location(0) vec4f {
+  return premultiply(i.color.rgb,coverage(length(i.along))*i.color.a*i.density);
+}
+
+@fragment fn fs_airbrush(i:Ink)->@location(0) vec4f {
+  let r=length(i.along);
+  let t=clamp((r-i.shade)/max(1.0-i.shade,0.001),0.0,1.0);
+  let falloff=(exp(-4.0*t*t)-exp(-4.0))/(1.0-exp(-4.0));
+  return premultiply(i.color.rgb,falloff*coverage(r)*i.color.a*i.density);
 }
 
 @fragment fn fs_brush(i: Ink) -> @location(0) vec4f {
@@ -163,7 +180,8 @@ fn simplex(v: vec2f) -> f32 {
 // Graphite: the paper's tooth, fixed in the document, with a fainter grain drawn out along the
 // stroke. Pressure decides how much of the tooth the lead reaches; tilt lays the lead on its side.
 @fragment fn fs_pencil(i: Ink) -> Layered {
-  let tooth = simplex(i.doc * 0.42) * 0.6 + simplex(i.doc * 1.1 + vec2f(31.0, 7.0)) * 0.4;
+  let phase=vec2f(i.phase*3.71,i.phase*7.13);
+  let tooth = simplex(i.doc * 0.42+phase) * 0.6 + simplex(i.doc * 1.1 + vec2f(31.0, 7.0)+phase) * 0.4;
   let streak = simplex(vec2f(i.along.x * 0.1, i.along.y * 0.7));
   let mixed = mix(tooth, streak, 0.25 + 0.35 * i.shade) * 0.5 + 0.5;
   let blur = clamp(length(fwidth(i.doc * 1.1)) - 0.7, 0.0, 1.0);

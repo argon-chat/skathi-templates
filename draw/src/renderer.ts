@@ -1,6 +1,10 @@
-import { IDENTITY, type Affine } from "./geometry";
+import { BlendPass } from "./blend";
+import { floodContours, type BucketOptions } from "./bucket";
+import { base64 } from "./smudge";
+import { pathBounds } from "./pigments";
+import { IDENTITY, union, type Affine } from "./geometry";
 import { type Bounds, type LiveSource, Mesh, tessellate, VERTEX_BYTES } from "./ink";
-import type { Layer, Paper, Stroke } from "./model";
+import { BLEND_MODES, type Layer, type Paper, type Stroke } from "./model";
 import { compositeShader, strokeShader } from "./shaders";
 
 const SAMPLES = 4;
@@ -38,15 +42,31 @@ export function meshOf(stroke: Stroke): Cached {
   return cached;
 }
 
-type Key = "pen" | "pen+" | "brush" | "brush+" | "marker" | "marker-glow" | "pencil" | "eraser" | "eraser+";
+type Key =
+  | "pen"
+  | "pen+"
+  | "brush"
+  | "brush+"
+  | "marker"
+  | "marker-glow"
+  | "pencil"
+  | "eraser"
+  | "eraser+"
+  | "spray"
+  | "airbrush"
+  | "smudge";
 
 function keyOf(stroke: Stroke): Key {
   const t = stroke.tool;
-  if (t === "marker" || t === "pencil") return t;
+  if (t === "marker" || t === "pencil" || t === "spray" || t === "airbrush" || t === "smudge") return t;
+  if (t === "bucket" || t === "lasso-fill") return "pen";
   return (stroke.opacity ?? 1) < 1 ? `${t}+` : t;
 }
 
+const instanceKey = (key: Key) => key === "spray" || key === "airbrush";
+
 interface Run {
+  locked: boolean;
   key: Key;
   first: number;
   count: number;
@@ -63,11 +83,14 @@ class LayerGpu {
   capacity = 0;
   vertices = 0;
   strokes: Stroke[] = [];
+  source: readonly Stroke[] | null = null;
   ends: number[] = [];
   runs: Run[] = [];
   target: Target | null = null;
   visible = true;
   opacity = -1;
+  blend = -1;
+  clipping = false;
   dirty = true;
 
   constructor(readonly opacityBuffer: GPUBuffer) {}
@@ -92,6 +115,7 @@ export interface Render {
   background: boolean;
   /** Paints the paper's dots or lines. */
   pattern: boolean;
+  layer?: string;
 }
 
 type Rgb = readonly [number, number, number];
@@ -108,6 +132,9 @@ interface LiveItem {
   buffer: GPUBuffer | null;
   capacity: number;
   uploaded: number;
+  previewCount: number;
+  previewAt: number;
+  reading: boolean;
 }
 
 export class Renderer {
@@ -135,13 +162,17 @@ export class Renderer {
   private viewChanged = true;
   private scheduled = false;
   private uniform = new Float32Array(24);
+  private readonly fullOpacity: GPUBuffer;
   private readonly viewBuffer: GPUBuffer;
   private readonly viewGroup: GPUBindGroup;
   private readonly identity: GPUBindGroup;
   private readonly floatModel: GPUBuffer;
   private readonly floatGroup: GPUBindGroup;
   private readonly pipelines: Record<Key, GPURenderPipeline>;
+  private lockedPipelines: Record<Key, GPURenderPipeline> | null = null;
   private readonly screen: Composites;
+  private offscreen: Composites | null = null;
+  private blend: BlendPass | null = null;
   private readonly textureLayout: GPUBindGroupLayout;
   private readonly viewLayout: GPUBindGroupLayout;
   private readonly modelLayout: GPUBindGroupLayout;
@@ -176,6 +207,8 @@ export class Renderer {
         { binding: 1, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "uniform" } },
       ],
     });
+    this.fullOpacity = this.uniformBuffer(16);
+    device.queue.writeBuffer(this.fullOpacity, 0, new Float32Array([1, 0, 0, 0]));
     this.viewBuffer = this.uniformBuffer(this.uniform.byteLength);
     this.viewGroup = this.groupFor(this.viewLayout, this.viewBuffer);
     const identity = this.uniformBuffer(32);
@@ -200,9 +233,17 @@ export class Renderer {
       if (!gpu) this.layers.set(layer.id, (gpu = new LayerGpu(this.uniformBuffer(16))));
       if (gpu.visible !== layer.visible) gpu.dirty = true;
       gpu.visible = layer.visible;
-      if (gpu.opacity !== layer.opacity) {
+      const mode = BLEND_MODES.indexOf(layer.blendMode ?? "normal"),
+        clipping = layer.clipping ?? false;
+      if (gpu.opacity !== layer.opacity || gpu.blend !== mode || gpu.clipping !== clipping) {
+        gpu.blend = mode;
+        gpu.clipping = clipping;
         gpu.opacity = layer.opacity;
-        this.device.queue.writeBuffer(gpu.opacityBuffer, 0, new Float32Array([layer.opacity, 0, 0, 0]));
+        this.device.queue.writeBuffer(
+          gpu.opacityBuffer,
+          0,
+          new Float32Array([layer.opacity, mode, Number(clipping), 0]),
+        );
       }
       const hidden = this.float?.layer === layer.id ? this.float.hidden : null;
       this.sync(gpu, hidden ? layer.strokes.filter((s) => !hidden.has(s)) : layer.strokes);
@@ -217,6 +258,14 @@ export class Renderer {
   }
 
   setTheme(paper: Rgb, ink: Rgb, pattern: Paper, opacity: number) {
+    const opacityValue = pattern === "plain" ? 0 : opacity;
+    if (
+      this.grid.mode === PATTERN[pattern].mode &&
+      this.grid.opacity === opacityValue &&
+      this.ink.every((v, i) => v === ink[i]) &&
+      this.paper.every((v, i) => v === paper[i])
+    )
+      return;
     this.paper = paper;
     this.ink = ink;
     this.grid = { opacity: pattern === "plain" ? 0 : opacity, ...PATTERN[pattern] };
@@ -239,6 +288,8 @@ export class Renderer {
     const w = Math.max(1, Math.round(width * dpr));
     const h = Math.max(1, Math.round(height * dpr));
     if (w === this.width && h === this.height && dpr === this.dpr && this.msaa) return;
+    this.blend?.destroy();
+    this.blend = null;
     this.width = w;
     this.height = h;
     this.dpr = dpr;
@@ -261,7 +312,18 @@ export class Renderer {
   /** Strokes in progress on `layer`: one, or one per mirrored copy. */
   beginLive(layer: string, sources: readonly LiveSource[]) {
     this.endLive();
-    this.live = { layer, items: sources.map((source) => ({ source, buffer: null, capacity: 0, uploaded: 0 })) };
+    this.live = {
+      layer,
+      items: sources.map((source) => ({
+        source,
+        buffer: null,
+        capacity: 0,
+        uploaded: 0,
+        previewCount: 0,
+        previewAt: 0,
+        reading: false,
+      })),
+    };
     this.updateLive();
   }
 
@@ -269,6 +331,41 @@ export class Renderer {
     const live = this.live;
     if (!live) return;
     for (const item of live.items) {
+      if (item.source.stroke.tool === "smudge") {
+        if (
+          !item.reading &&
+          item.source.stroke.points.length >= 14 &&
+          item.source.stroke.points.length !== item.previewAt
+        ) {
+          item.reading = true;
+          const stroke = { ...item.source.stroke, points: item.source.stroke.points.slice() };
+          item.previewAt = stroke.points.length;
+          void this.smudge(stroke, live.layer)
+            .then((sample) => {
+              if (this.live !== live) return;
+              const mesh = meshOf(sample);
+              if (mesh.bytes.length > item.capacity || !item.buffer) {
+                item.buffer?.destroy();
+                item.capacity = Math.max(65536, mesh.bytes.length * 2);
+                item.buffer = this.device.createBuffer({
+                  size: item.capacity,
+                  usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+                });
+              }
+              if (mesh.vertices) this.device.queue.writeBuffer(item.buffer, 0, mesh.bytes);
+              item.previewCount = mesh.vertices;
+              const target = this.layers.get(live.layer);
+              if (target) target.dirty = true;
+              this.request();
+            })
+            .catch(() => {})
+            .finally(() => {
+              item.reading = false;
+              if (this.live === live && item.source.stroke.points.length !== item.previewAt) this.updateLive();
+            });
+        }
+        continue;
+      }
       const { settled, tail } = item.source;
       const needed = (settled.count + tail.count) * VERTEX_BYTES;
       if (needed > item.capacity || !item.buffer) {
@@ -358,7 +455,8 @@ export class Renderer {
       format: LAYER_FORMAT,
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
-    const composite = this.composites(LAYER_FORMAT);
+    const composite = (this.offscreen ??= this.composites(LAYER_FORMAT));
+    const blend = !options.layer && this.needsBlend ? new BlendPass(device, w, h) : null;
     const stride = Math.ceil((w * 4) / 256) * 256;
     const readback = device.createBuffer({
       size: stride * h,
@@ -368,7 +466,9 @@ export class Renderer {
     const [r, g, b] = this.paper;
     const clear = options.background ? { r, g, b, a: 1 } : { r: 0, g: 0, b: 0, a: 0 };
     const base = encoder.beginRenderPass({
-      colorAttachments: [{ view: out.createView(), clearValue: clear, loadOp: "clear", storeOp: "store" }],
+      colorAttachments: [
+        { view: blend?.begin(encoder) ?? out.createView(), clearValue: clear, loadOp: "clear", storeOp: "store" },
+      ],
     });
     if (options.pattern && this.grid.opacity > 0) {
       base.setBindGroup(0, group);
@@ -379,14 +479,35 @@ export class Renderer {
     const glow = options.background && this.dark;
     for (const l of this.order) {
       const gpu = this.layers.get(l.id);
-      if (!gpu || !l.visible || !gpu.vertices) continue;
+      if (!gpu) continue;
+      if (!l.visible || !gpu.vertices) {
+        blend?.layer(encoder, null, gpu.opacityBuffer);
+        continue;
+      }
+      if (options.layer && l.id !== options.layer) continue;
       this.drawLayer(encoder, gpu, l.id, layerView, msaa.view, depth.view, group, false, glow);
+      if (blend) {
+        blend.layer(encoder, layerView, gpu.opacityBuffer);
+        continue;
+      }
       const pass = encoder.beginRenderPass({
         colorAttachments: [{ view: out.createView(), loadOp: "load", storeOp: "store" }],
       });
       pass.setBindGroup(0, group);
       pass.setPipeline(composite.layer);
-      pass.setBindGroup(1, this.layerGroup(layerView, gpu.opacityBuffer));
+      pass.setBindGroup(1, this.layerGroup(layerView, options.layer ? this.fullOpacity : gpu.opacityBuffer));
+      pass.draw(3);
+      pass.end();
+    }
+    if (blend) {
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          { view: out.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+        ],
+      });
+      pass.setPipeline(composite.layer);
+      pass.setBindGroup(0, group);
+      pass.setBindGroup(1, this.layerGroup(blend.view, this.fullOpacity));
       pass.draw(3);
       pass.end();
     }
@@ -409,6 +530,7 @@ export class Renderer {
       }
       return { pixels, w, h };
     } finally {
+      blend?.destroy();
       for (const t of [msaa.texture, depth.texture, layer, out]) t.destroy();
       readback.destroy();
       ubo.destroy();
@@ -426,6 +548,68 @@ export class Renderer {
     return canvas.convertToBlob({ type: "image/png" });
   }
 
+  async bucket(x: number, y: number, options: BucketOptions): Promise<number[][] | null> {
+    let content: Bounds | null = null;
+    for (const layer of this.order) {
+      if (!layer.visible || (options.layer && options.layer !== layer.id)) continue;
+      for (const stroke of layer.strokes) content = union(content, meshOf(stroke).bounds);
+    }
+    if (!content || x < content.minX - 2 || x > content.maxX + 2 || y < content.minY - 2 || y > content.maxY + 2)
+      return null;
+    const pad = Math.ceil(options.gap + options.expand) + 4;
+    for (let half = 128; ; half *= 2) {
+      const bounds = {
+        minX: Math.max(Math.floor(content.minX) - pad, Math.floor(x) - half),
+        minY: Math.max(Math.floor(content.minY) - pad, Math.floor(y) - half),
+        maxX: Math.min(Math.ceil(content.maxX) + pad, Math.ceil(x) + half),
+        maxY: Math.min(Math.ceil(content.maxY) + pad, Math.ceil(y) + half),
+      };
+      const width = bounds.maxX - bounds.minX,
+        height = bounds.maxY - bounds.minY;
+      if (width > MAX_EXPORT || height > MAX_EXPORT || width * height > 16_777_216)
+        throw new Error("This fill region is too large for a document-resolution sample.");
+      const { pixels, w, h } = await this.render(bounds, 1, {
+        background: !options.layer,
+        pattern: false,
+        ...(options.layer ? { layer: options.layer } : {}),
+      });
+      const result = floodContours(
+        pixels,
+        w,
+        h,
+        Math.floor(x) - bounds.minX,
+        Math.floor(y) - bounds.minY,
+        bounds.minX,
+        bounds.minY,
+        options,
+      );
+      if (
+        result ||
+        (bounds.minX <= Math.floor(content.minX) - pad &&
+          bounds.maxX >= Math.ceil(content.maxX) + pad &&
+          bounds.minY <= Math.floor(content.minY) - pad &&
+          bounds.maxY >= Math.ceil(content.maxY) + pad)
+      )
+        return result;
+    }
+  }
+
+  async smudge(stroke: Stroke, layer: string): Promise<Stroke> {
+    const b = pathBounds(stroke, stroke.width / 2 + 2);
+    const bounds = {
+      minX: Math.floor(b.minX),
+      minY: Math.floor(b.minY),
+      maxX: Math.ceil(b.maxX),
+      maxY: Math.ceil(b.maxY),
+    };
+    const w = bounds.maxX - bounds.minX,
+      h = bounds.maxY - bounds.minY;
+    if (w > MAX_EXPORT || h > MAX_EXPORT || w * h > 16_777_216)
+      throw new Error("This smudge is too large for a document-resolution sample.");
+    const image = await this.render(bounds, 1, { background: false, pattern: false, layer });
+    return { ...stroke, patch: { x: bounds.minX, y: bounds.minY, width: w, height: h, rgba: base64(image.pixels) } };
+  }
+
   /** The colour on screen at a document point, as drawn at the current zoom. */
   async pick(x: number, y: number): Promise<[number, number, number]> {
     const half = 0.5 / (this.view.zoom * this.dpr);
@@ -439,9 +623,14 @@ export class Renderer {
     for (const texture of this.owned) texture.destroy();
     this.endLive();
     this.dropFloat();
+    this.blend?.destroy();
     this.overlayBuffer?.destroy();
     this.context.unconfigure();
     this.device.destroy();
+  }
+
+  private get needsBlend() {
+    return this.order.some((l) => l.visible && (l.clipping || (l.blendMode ?? "normal") !== "normal"));
   }
 
   private get dark() {
@@ -472,25 +661,38 @@ export class Renderer {
     if (this.overlayDirty || this.viewChanged) this.uploadOverlay();
     this.viewChanged = false;
     const [r, g, b] = this.paper;
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: this.context.getCurrentTexture().createView(),
-          clearValue: { r, g, b, a: 1 },
-          loadOp: "clear",
-          storeOp: "store",
-        },
-      ],
+    const target = this.context.getCurrentTexture().createView();
+    const blend = this.needsBlend ? (this.blend ??= new BlendPass(this.device, this.width, this.height)) : null;
+    const clear = { r, g, b, a: 1 };
+    const attachment = blend?.begin(encoder) ?? target;
+    let pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: attachment, clearValue: clear, loadOp: "clear", storeOp: "store" }],
     });
     pass.setBindGroup(0, this.viewGroup);
     if (this.grid.opacity > 0) {
-      pass.setPipeline(this.screen.grid);
+      pass.setPipeline(blend ? (this.offscreen ??= this.composites(LAYER_FORMAT)).grid : this.screen.grid);
       pass.draw(3);
     }
-    pass.setPipeline(this.screen.layer);
-    for (const gpu of shown) {
-      pass.setBindGroup(1, gpu.target!.group);
+    if (blend) {
+      pass.end();
+      const visible = new Set(shown);
+      for (const l of this.order) {
+        const gpu = this.layers.get(l.id);
+        if (gpu) blend.layer(encoder, visible.has(gpu) ? gpu.target!.view : null, gpu.opacityBuffer);
+      }
+      pass = encoder.beginRenderPass({
+        colorAttachments: [{ view: target, clearValue: clear, loadOp: "clear", storeOp: "store" }],
+      });
+      pass.setBindGroup(0, this.viewGroup);
+      pass.setPipeline(this.screen.layer);
+      pass.setBindGroup(1, this.layerGroup(blend.view, this.fullOpacity));
       pass.draw(3);
+    } else {
+      pass.setPipeline(this.screen.layer);
+      for (const gpu of shown) {
+        pass.setBindGroup(1, gpu.target!.group);
+        pass.draw(3);
+      }
     }
     if (this.overlayCount && this.overlayBuffer) {
       pass.setPipeline(this.screen.mark);
@@ -555,11 +757,14 @@ export class Renderer {
     }
     if (live && this.live?.layer === id) {
       for (const item of this.live.items) {
-        const count = item.source.settled.count + item.source.tail.count;
+        const count =
+          item.source.stroke.tool === "smudge" ? item.previewCount : item.source.settled.count + item.source.tail.count;
         if (!count || !item.buffer) continue;
         pass.setVertexBuffer(0, item.buffer);
-        pass.setPipeline(this.pipeline(keyOf(item.source.stroke), glow));
-        pass.draw(count);
+        const key = keyOf(item.source.stroke);
+        pass.setPipeline(this.pipeline(key, glow, item.source.stroke.alphaLocked ?? false));
+        if (instanceKey(key)) pass.draw(6, count);
+        else pass.draw(count);
       }
     }
     pass.end();
@@ -569,17 +774,21 @@ export class Renderer {
     if (!gpu.buffer || !gpu.vertices) return;
     pass.setVertexBuffer(0, gpu.buffer);
     for (const run of gpu.runs) {
-      pass.setPipeline(this.pipeline(run.key, glow));
-      pass.draw(run.count, 1, run.first);
+      pass.setPipeline(this.pipeline(run.key, glow, run.locked));
+      if (instanceKey(run.key)) pass.draw(6, run.count, 0, run.first);
+      else pass.draw(run.count, 1, run.first);
     }
   }
 
-  private pipeline(key: Key, glow: boolean): GPURenderPipeline {
-    return this.pipelines[glow && key === "marker" ? "marker-glow" : key];
+  private pipeline(key: Key, glow: boolean, locked: boolean): GPURenderPipeline {
+    const pipelines = locked ? (this.lockedPipelines ??= this.strokePipelines(true)) : this.pipelines;
+    return pipelines[glow && key === "marker" ? "marker-glow" : key];
   }
 
   /** Uploads what changed: strokes appended at the end are added, anything else re-copies from where it differs. */
   private sync(gpu: LayerGpu, strokes: readonly Stroke[]) {
+    if (gpu.source === strokes) return;
+    gpu.source = strokes;
     let same = 0;
     const n = Math.min(strokes.length, gpu.strokes.length);
     while (same < n && gpu.strokes[same] === strokes[same]) same++;
@@ -590,28 +799,26 @@ export class Renderer {
     const added = strokes.slice(same).map(meshOf);
     const total = gpu.vertices + added.reduce((sum, m) => sum + m.vertices, 0);
     this.reserve(gpu, total * VERTEX_BYTES);
-    if (added.length) {
-      const bytes = new Uint8Array((total - gpu.vertices) * VERTEX_BYTES);
-      let at = 0;
-      for (const [i, mesh] of added.entries()) {
-        bytes.set(mesh.bytes, at);
-        at += mesh.bytes.length;
-        gpu.strokes.push(strokes[same + i]!);
-        gpu.ends.push(gpu.vertices + at / VERTEX_BYTES);
-      }
-      this.device.queue.writeBuffer(gpu.buffer!, gpu.vertices * VERTEX_BYTES, bytes);
-    }
-    gpu.vertices = total;
-    gpu.runs = [];
-    let first = 0;
-    for (const [i, stroke] of gpu.strokes.entries()) {
-      const end = gpu.ends[i]!;
-      const key = keyOf(stroke);
+    while (gpu.runs.length && gpu.runs.at(-1)!.first >= gpu.vertices) gpu.runs.pop();
+    const tail = gpu.runs.at(-1);
+    if (tail) tail.count = gpu.vertices - tail.first;
+    let first = gpu.vertices;
+    const bytes = added.length === 1 ? added[0]!.bytes : new Uint8Array((total - first) * VERTEX_BYTES);
+    for (let i = 0; i < added.length; i++) {
+      const mesh = added[i]!,
+        stroke = strokes[same + i]!;
+      if (added.length > 1) bytes.set(mesh.bytes, (first - gpu.vertices) * VERTEX_BYTES);
+      const key = keyOf(stroke),
+        locked = stroke.alphaLocked ?? false;
       const last = gpu.runs.at(-1);
-      if (last && last.key === key) last.count += end - first;
-      else if (end > first) gpu.runs.push({ key, first, count: end - first });
-      first = end;
+      if (last && last.key === key && last.locked === locked) last.count += mesh.vertices;
+      else if (mesh.vertices) gpu.runs.push({ key, locked, first, count: mesh.vertices });
+      first += mesh.vertices;
+      gpu.strokes.push(stroke);
+      gpu.ends.push(first);
     }
+    if (bytes.length) this.device.queue.writeBuffer(gpu.buffer!, gpu.vertices * VERTEX_BYTES, bytes);
+    gpu.vertices = total;
     gpu.dirty = true;
   }
 
@@ -690,21 +897,25 @@ export class Renderer {
     }) as [{ texture: GPUTexture; view: GPUTextureView }, { texture: GPUTexture; view: GPUTextureView }];
   }
 
-  private strokePipelines(): Record<Key, GPURenderPipeline> {
+  private strokePipelines(locked = false): Record<Key, GPURenderPipeline> {
     const module = this.device.createShaderModule({ code: strokeShader });
     const layout = this.device.createPipelineLayout({ bindGroupLayouts: [this.viewLayout, this.modelLayout] });
     const over = { srcFactor: "one", dstFactor: "one-minus-src-alpha" } as const;
     const erase = { srcFactor: "zero", dstFactor: "one-minus-src-alpha" } as const;
     const screen = { srcFactor: "one", dstFactor: "one-minus-src" } as const;
-    const make = (entryPoint: string, color: GPUBlendComponent, layered: boolean, alpha = color) =>
+    const preserve = { srcFactor: "zero", dstFactor: "one" } as const;
+    const atop = { srcFactor: "dst-alpha", dstFactor: "one-minus-src-alpha" } as const;
+    const replace = { srcFactor: "one", dstFactor: "zero" } as const;
+    const make = (entryPoint: string, color: GPUBlendComponent, layered: boolean, alpha = color, instances = false) =>
       this.device.createRenderPipeline({
         layout,
         vertex: {
           module,
-          entryPoint: "vs",
+          entryPoint: instances ? "vs_dab" : "vs",
           buffers: [
             {
               arrayStride: VERTEX_BYTES,
+              stepMode: instances ? "instance" : "vertex",
               attributes: [
                 { format: "float32x2", offset: 0, shaderLocation: 0 },
                 { format: "snorm8x4", offset: 8, shaderLocation: 1 },
@@ -715,7 +926,19 @@ export class Renderer {
             },
           ],
         },
-        fragment: { module, entryPoint, targets: [{ format: LAYER_FORMAT, blend: { color, alpha } }] },
+        fragment: {
+          module,
+          entryPoint,
+          targets: [
+            {
+              format: LAYER_FORMAT,
+              blend:
+                locked && color !== replace
+                  ? { color: color === erase ? preserve : atop, alpha: preserve }
+                  : { color, alpha },
+            },
+          ],
+        },
         primitive: { topology: "triangle-list" },
         depthStencil: {
           format: DEPTH_FORMAT,
@@ -725,6 +948,9 @@ export class Renderer {
         multisample: { count: SAMPLES },
       });
     return {
+      spray: make("fs_spray", over, false, over, true),
+      airbrush: make("fs_airbrush", over, false, over, true),
+      smudge: make("fs_pen", replace, false),
       pen: make("fs_pen", over, false),
       "pen+": make("fs_pen_layered", over, true),
       brush: make("fs_brush", over, false),

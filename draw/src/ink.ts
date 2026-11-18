@@ -1,4 +1,6 @@
-import type { Bounds } from "./geometry";
+import { dabStream, pathBounds, polygonMesh, strokeRings, type Dab } from "./pigments";
+import { smudgedPixels } from "./smudge";
+import { apply, IDENTITY, type Bounds } from "./geometry";
 import { rgb, STRIDE, type Stroke, type Tool } from "./model";
 
 export type { Bounds };
@@ -23,6 +25,7 @@ export class Mesh {
   private alpha = 255;
   private ink = 0;
   private depth = 0;
+  private noise = 0;
 
   constructor(capacity = 1024) {
     this.bytes = new ArrayBuffer(capacity * VERTEX_BYTES);
@@ -34,12 +37,22 @@ export class Mesh {
   style(stroke: Stroke) {
     const [r, g, b] = stroke.color === "ink" ? [0, 0, 0] : rgb(stroke.color);
     const alpha = (stroke.tool === "marker" ? 0.4 : stroke.tool === "pencil" ? 0.92 : 1) * (stroke.opacity ?? 1);
+    this.noise = stroke.tool === "pencil" ? (stroke.seed ?? 0) % 65521 : 0;
     this.red = r;
     this.green = g;
     this.blue = b;
     this.alpha = Math.round(alpha * 255);
-    this.ink = stroke.color === "ink" ? 127 : 0;
+    const phase = this.noise % 127;
+    this.ink = stroke.color === "ink" ? phase + 1 : -phase;
     this.depth = Math.min(stroke.seq, DEPTH_STEPS) / DEPTH_STEPS;
+  }
+
+  rgba(r: number, g: number, b: number, a: number) {
+    this.red = r;
+    this.green = g;
+    this.blue = b;
+    this.alpha = a;
+    this.ink = 0;
   }
 
   reset() {
@@ -61,7 +74,7 @@ export class Mesh {
     this.u8[o + 6] = this.blue;
     this.u8[o + 7] = this.alpha;
     this.f32[f + 4] = this.depth;
-    this.f32[f + 5] = u;
+    this.f32[f + 5] = u + this.noise;
     this.f32[f + 6] = v;
     this.count++;
   }
@@ -94,6 +107,12 @@ function shape(tool: Tool, width: number, p: number, tiltX: number, tiltY: numbe
       return [half, 1, 0];
     case "pencil":
       return [half * (0.8 + 0.3 * p) * (1 + 2.4 * tilt), Math.min(1, (0.35 + 0.65 * p) * (1 - 0.15 * tilt)), tilt];
+    case "bucket":
+    case "lasso-fill":
+    case "spray":
+    case "airbrush":
+    case "smudge":
+      return [half, 1, 0];
     case "eraser":
       return [half * (0.8 + 0.4 * p), 1, 0];
   }
@@ -369,11 +388,64 @@ export function trace(stroke: Stroke, out: Trace): Bounds {
 
 /** The whole stroke, end taper included: what is stored on the GPU once committed. */
 export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
-  const ribbon = new Ribbon(mesh);
   mesh.style(stroke);
+  if (stroke.tool === "bucket" || stroke.tool === "lasso-fill") {
+    polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0));
+    return pathBounds(stroke);
+  }
+  if (stroke.tool === "spray" || stroke.tool === "airbrush") {
+    const emit = dabVertex(mesh, stroke);
+    const add = dabStream(stroke);
+    for (let i = 0; i < stroke.points.length; i += STRIDE) add(i, emit);
+    return pathBounds(stroke, stroke.width * (stroke.tool === "spray" ? 2 : 0.5));
+  }
+  if (stroke.tool === "smudge") {
+    const patch = stroke.patch,
+      result = smudgedPixels(stroke);
+    if (patch && result) {
+      const { pixels, mask, w, h } = result;
+      const m = patch.transform ?? IDENTITY;
+      const vertex = (x: number, y: number) => {
+        const q = apply(m, x + patch.x, y + patch.y);
+        mesh.vertex(q.x, q.y, 0, 1, 0, 0, 0);
+      };
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < w;) {
+          const k = (y * w + x) * 4;
+          if (!mask[k / 4]) {
+            x++;
+            continue;
+          }
+          let end = x + 1;
+          while (
+            end < w &&
+            mask[y * w + end] &&
+            pixels[(y * w + end) * 4] === pixels[k] &&
+            pixels[(y * w + end) * 4 + 1] === pixels[k + 1] &&
+            pixels[(y * w + end) * 4 + 2] === pixels[k + 2] &&
+            pixels[(y * w + end) * 4 + 3] === pixels[k + 3]
+          )
+            end++;
+          mesh.rgba(pixels[k]!, pixels[k + 1]!, pixels[k + 2]!, pixels[k + 3]!);
+          vertex(x, y);
+          vertex(end, y);
+          vertex(x, y + 1);
+          vertex(x, y + 1);
+          vertex(end, y);
+          vertex(end, y + 1);
+          x = end;
+        }
+    }
+    return pathBounds(stroke, stroke.width / 2 + 1);
+  }
+  const ribbon = new Ribbon(mesh);
   const bounds = trace(stroke, (x, y, r, a, b, s) => ribbon.push(x, y, r, a, b, s));
   ribbon.finish();
   return bounds;
+}
+
+function dabVertex(mesh: Mesh, stroke: Stroke) {
+  return ({ x, y, radius, opacity }: Dab) => mesh.vertex(x, y, 0, opacity, stroke.hardness ?? 0.25, radius, 0);
 }
 
 /** Geometry the renderer draws while a stroke is in progress. */
@@ -402,6 +474,7 @@ export class LiveStroke implements LiveSource {
   readonly settled = new Mesh(4096);
   readonly tail = new Mesh(1024);
   private ribbon: Ribbon;
+  private dabs: ReturnType<typeof dabStream> | null = null;
   private finalized = 0;
   private s = 0;
   private lx = 0;
@@ -411,6 +484,7 @@ export class LiveStroke implements LiveSource {
     this.settled.style(stroke);
     this.tail.style(stroke);
     this.ribbon = new Ribbon(this.settled);
+    if (stroke.tool === "spray" || stroke.tool === "airbrush") this.dabs = dabStream(stroke);
   }
 
   get count() {
@@ -421,6 +495,11 @@ export class LiveStroke implements LiveSource {
     const pts = this.stroke.points;
     pts.push(x, y, p, tiltX, tiltY, twist, t);
     const count = this.count;
+    if (this.dabs) {
+      this.dabs(pts.length - STRIDE, dabVertex(this.settled, this.stroke));
+      return;
+    }
+    if (this.stroke.tool === "lasso-fill" || this.stroke.tool === "smudge" || this.stroke.tool === "bucket") return;
     if (count === 1) {
       this.lx = x;
       this.ly = y;
@@ -432,6 +511,11 @@ export class LiveStroke implements LiveSource {
   /** Rebuilds the tail: the last curve, then the predicted readings, each `[x, y]` in document space. */
   build(predicted: readonly (readonly [number, number])[]) {
     this.tail.reset();
+    if (this.dabs) return;
+    if (this.stroke.tool === "lasso-fill" || this.stroke.tool === "smudge" || this.stroke.tool === "bucket") {
+      tessellate(this.stroke, this.tail);
+      return;
+    }
     const ribbon = this.ribbon.clone(this.tail);
     const { s, lx, ly } = this;
     const pts = this.stroke.points;

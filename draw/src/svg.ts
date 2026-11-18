@@ -1,3 +1,6 @@
+import { dabStream, strokeRings } from "./pigments";
+import { pngData, smudgedPixels } from "./smudge";
+import { STRIDE } from "./model";
 import type { Bounds } from "./geometry";
 import { trace } from "./ink";
 import type { Color, Layer, Paper, Stroke } from "./model";
@@ -73,7 +76,7 @@ export interface SvgOptions {
 const escape = (s: string) => s.replace(/[<>&"]/g, (c) => `&#${c.charCodeAt(0)};`);
 
 /** The visible layers as vector paths; an eraser stroke masks out what was drawn before it on its layer. */
-export function toSvg(layers: readonly Layer[], o: SvgOptions): string {
+export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<string> {
   const { minX, minY, maxX, maxY } = o.bounds;
   const w = maxX - minX;
   const h = maxY - minY;
@@ -86,28 +89,106 @@ export function toSvg(layers: readonly Layer[], o: SvgOptions): string {
     defs.push(PATTERNS[o.pattern](o.ink, o.patternOpacity));
     body.push(`<rect x="${n(minX)}" y="${n(minY)}" width="${n(w)}" height="${n(h)}" fill="url(#paper)"/>`);
   }
+  const area = `x="${n(minX)}" y="${n(minY)}" width="${n(w)}" height="${n(h)}"`;
+  let below: string | null = null;
+  const mask = (body: string, alpha = false) => {
+    const id = `mask-${++masks}`;
+    defs.push(
+      `<mask id="${id}" maskUnits="userSpaceOnUse" ${area}${alpha ? ' style="mask-type:alpha"' : ""}>${body}</mask>`,
+    );
+    return id;
+  };
   for (const layer of layers) {
-    if (!layer.visible || !layer.strokes.length) continue;
+    if (!layer.visible || !layer.strokes.length) {
+      below = null;
+      continue;
+    }
     let content = "";
     for (const stroke of layer.strokes) {
-      const d = outline(stroke);
-      if (!d) continue;
-      if (stroke.tool === "eraser") {
-        const id = `erase-${++masks}`;
-        defs.push(
-          `<mask id="${id}" maskUnits="userSpaceOnUse" x="${n(minX)}" y="${n(minY)}" width="${n(w)}" height="${n(h)}">` +
-            `<rect x="${n(minX)}" y="${n(minY)}" width="${n(w)}" height="${n(h)}" fill="#fff"/>` +
-            `<path d="${d}" fill="#000" fill-opacity="${alpha(stroke)}"/></mask>`,
+      if (stroke.tool === "eraser" && stroke.alphaLocked) continue;
+      const fill = stroke.color === "ink" ? o.ink : stroke.color;
+      let mark = "";
+      if (stroke.tool === "smudge") {
+        const result = smudgedPixels(stroke),
+          patch = stroke.patch;
+        if (!result || !patch) continue;
+        const cut = new Uint8ClampedArray(result.pixels.length);
+        for (let i = 0; i < result.mask.length; i++) {
+          if (result.mask[i]) cut[i * 4 + 3] = 255;
+          else result.pixels[i * 4 + 3] = 0;
+        }
+        const attrs = `x="${patch.x}" y="${patch.y}" width="${patch.width}" height="${patch.height}"${patch.transform ? ` transform="matrix(${patch.transform.join(" ")})"` : ""}`;
+        const id = mask(
+          `<rect ${area} fill="#fff"/><image ${attrs} href="${await pngData(cut, result.w, result.h)}"/>`,
         );
-        content = `<g mask="url(#${id})">${content}</g>`;
+        content = `<g mask="url(#${id})">${content}</g><image ${attrs} href="${await pngData(result.pixels, result.w, result.h)}"/>`;
         continue;
       }
-      const fill = stroke.color === "ink" ? o.ink : stroke.color;
-      const a = alpha(stroke);
-      content += `<path d="${d}" fill="${fill}"${a < 1 ? ` fill-opacity="${n(a)}"` : ""}/>`;
+      if (stroke.tool === "spray" || stroke.tool === "airbrush") {
+        const add = dabStream(stroke);
+        let paint = fill;
+        if (stroke.tool === "airbrush") {
+          const id = `air-${++masks}`,
+            h = stroke.hardness ?? 0.25;
+          const stops = [0, 0.25, 0.5, 0.75, 1]
+            .map(
+              (t) =>
+                `<stop offset="${h + (1 - h) * t}" stop-color="${fill}" stop-opacity="${(Math.exp(-4 * t * t) - Math.exp(-4)) / (1 - Math.exp(-4))}"/>`,
+            )
+            .join("");
+          defs.push(`<radialGradient id="${id}">${stops}</radialGradient>`);
+          paint = `url(#${id})`;
+        }
+        const dots: string[] = [];
+        for (let i = 0; i < stroke.points.length; i += STRIDE)
+          add(i, (d) =>
+            dots.push(
+              `<circle cx="${n(d.x)}" cy="${n(d.y)}" r="${n(d.radius)}" opacity="${n(d.opacity * (stroke.opacity ?? 1))}"/>`,
+            ),
+          );
+        mark = `<g fill="${paint}">${dots.join("")}</g>`;
+      } else {
+        const d =
+          stroke.tool === "lasso-fill" || stroke.tool === "bucket"
+            ? strokeRings(stroke)
+                .filter((r) => r.length >= 6)
+                .map((r) => {
+                  const points: string[] = [];
+                  for (let i = 0; i < r.length; i += 2) points.push(`${n(r[i]!)} ${n(r[i + 1]!)}`);
+                  return "M" + points.join("L") + "Z";
+                })
+                .join("")
+            : outline(stroke);
+        if (!d) continue;
+        if (stroke.tool === "eraser") {
+          const id = mask(`<rect ${area} fill="#fff"/><path d="${d}" fill="#000" fill-opacity="${alpha(stroke)}"/>`);
+          content = `<g mask="url(#${id})">${content}</g>`;
+          continue;
+        }
+        mark = `<path d="${d}" fill="${fill}" fill-rule="evenodd"${alpha(stroke) < 1 ? ` fill-opacity="${n(alpha(stroke))}"` : ""}/>`;
+      }
+      if (stroke.alphaLocked) {
+        const base = `prior-${++masks}`;
+        defs.push(`<g id="${base}">${content}</g>`);
+        const id = mask(`<use href="#${base}"/>`, true);
+        content = `<use href="#${base}"/><g mask="url(#${id})">${mark}</g>`;
+      } else content += mark;
     }
+    if (layer.clipping) {
+      if (!below) {
+        below = null;
+        continue;
+      }
+      const id = mask(`<use href="#${below}"/>`, true);
+      content = `<g mask="url(#${id})">${content}</g>`;
+    }
+    const id = `layer-${++masks}`;
     const opacity = layer.opacity < 1 ? ` opacity="${n(layer.opacity)}"` : "";
-    body.push(`<g id="${escape(layer.id)}" data-name="${escape(layer.name)}"${opacity}>${content}</g>`);
+    const blend = layer.blendMode === "add" ? "plus-lighter" : layer.blendMode;
+    const style = blend && blend !== "normal" ? ` style="mix-blend-mode:${blend}"` : "";
+    defs.push(`<g id="${id}"${opacity}>${content}</g>`);
+    body.push(`<use id="${escape(layer.id)}" data-name="${escape(layer.name)}" href="#${id}"${style}/>`);
+    below = id;
   }
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${n(minX)} ${n(minY)} ${n(w)} ${n(h)}" width="${Math.ceil(w)}" height="${Math.ceil(h)}">` +

@@ -57,7 +57,18 @@ export function transformStroke(stroke: Stroke, m: Affine, seq = stroke.seq): St
     points[i + 1] = p.y;
   }
   const width = stroke.width * Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
-  return { ...stroke, seq, points, width };
+  const result: Stroke = { ...stroke, seq, points, width };
+  if (stroke.contours)
+    result.contours = stroke.contours.map((ring) => {
+      const out: number[] = [];
+      for (let i = 0; i < ring.length; i += 2) {
+        const p = apply(m, ring[i]!, ring[i + 1]!);
+        out.push(p.x, p.y);
+      }
+      return out;
+    });
+  if (stroke.patch) result.patch = { ...stroke.patch, transform: [...multiply(m, stroke.patch.transform ?? IDENTITY)] };
+  return result;
 }
 
 export function insidePolygon(x: number, y: number, poly: readonly number[]): boolean {
