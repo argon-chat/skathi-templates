@@ -1,4 +1,4 @@
-import { recordingHeader, metaChunk, eventsChunk, endChunk } from "../src/events";
+import { recordingHeader, metaChunk, eventsChunk, endChunk, decodeRecording, joinBytes } from "../src/events";
 import type { Stroke } from "../src/model";
 
 const hz = 240,
@@ -9,8 +9,8 @@ function sample() {
   state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
   return state / 2 ** 32;
 }
-let bytes =
-  header.length +
+const chunks = [
+  header,
   metaChunk({
     width: 1920,
     height: 1080,
@@ -18,7 +18,8 @@ let bytes =
     dark: false,
     seed: state,
     view: { x: 0, y: 0, angle: 0, zoom: 1 },
-  }).length;
+  }),
+];
 let elapsed = 0;
 for (let seq = 1; seq <= strokes; seq++) {
   const points: number[] = [];
@@ -39,9 +40,16 @@ for (let seq = 1; seq <= strokes; seq++) {
     );
   }
   const stroke: Stroke = { seq, tool: "pencil", color: "ink", width: 3.4, seed: state, points };
-  bytes += (await eventsChunk([{ kind: "stroke", layer: "layer-1", strokes: [stroke], at: elapsed + 1000 }], elapsed))
-    .length;
+  chunks.push(
+    await eventsChunk([{ kind: "stroke", layer: "layer-1", strokes: [stroke], at: elapsed + 1000 }], elapsed),
+  );
   elapsed += 1000;
 }
-bytes += endChunk(elapsed, strokes).length;
-console.log(`${elapsed} ms, ${strokes} strokes, ${hz} samples/s, ${bytes} bytes (${(bytes / 1e6).toFixed(3)} MB)`);
+chunks.push(endChunk(elapsed, strokes));
+const file = joinBytes(chunks),
+  before = 5_766_655;
+console.log(
+  `${elapsed} ms, ${strokes} strokes, ${hz} samples/s, ${file.length} bytes (${(100 * (1 - file.length / before)).toFixed(2)}% below SKEV v1)`,
+);
+const result = await decodeRecording(file);
+if (result.events.length !== strokes || result.duration !== elapsed) throw new Error("Incomplete synthetic hour.");
