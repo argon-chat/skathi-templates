@@ -3,8 +3,8 @@ import type { Layer, Stroke, Tool } from "./model";
 import { compositeShader, strokeShader } from "./shaders";
 
 const SAMPLES = 4;
-const LAYER_FORMAT = "rgba8unorm";
-const DEPTH_FORMAT = "depth32float";
+const LAYER_FORMAT: GPUTextureFormat = "rgba8unorm";
+const DEPTH_FORMAT: GPUTextureFormat = "depth32float";
 
 type CanvasFormat = ReturnType<GPU["getPreferredCanvasFormat"]>;
 const MAX_EXPORT = 8192;
