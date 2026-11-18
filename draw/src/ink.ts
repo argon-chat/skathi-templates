@@ -9,8 +9,10 @@ export type { Bounds };
  * stroke's own coordinates: distance along it and across it (float32 × 2).
  */
 export const VERTEX_BYTES = 28;
+export const MAX_FILL_VERTICES = 300_000;
 const DEPTH_STEPS = 2 ** 23;
 const SHARP = 0.6;
+const RIBBON_PAGE_POINTS = 96;
 
 export class Mesh {
   count = 0;
@@ -344,40 +346,100 @@ function curve(pts: ArrayLike<number>, count: number, i: number, after: ArrayLik
 
 type Trace = (x: number, y: number, r: number, a: number, b: number, s: number) => void;
 
-/** Walks the finished stroke's outline samples: centre, radius, density, shading and distance along it. */
-export function trace(stroke: Stroke, out: Trace): Bounds {
-  const { tool, width, points } = stroke;
+function readings(stroke: Stroke, from: number, to: number, sink: Sink) {
+  const { points } = stroke;
   const count = points.length / STRIDE;
-  const samples: number[] = [];
-  let s = 0;
-  let lx = points[0] ?? 0;
-  let ly = points[1] ?? 0;
-  const sink: Sink = (x, y, p, tx, ty) => {
-    s += Math.hypot(x - lx, y - ly);
-    lx = x;
-    ly = y;
-    samples.push(x, y, p, tx, ty, s);
-  };
-  for (let i = 0; i < count; i++) {
+  for (let i = from; i < to; i++) {
     const k = i * STRIDE;
     if (i === 0 || stroke.shape) sink(points[k]!, points[k + 1]!, points[k + 2]!, points[k + 3]!, points[k + 4]!);
     else curve(points, count, i - 1, null, sink);
   }
-  const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-  const L = taperLength(width);
-  const tapered = !stroke.shape && tapers(tool) && samples.length > 6;
-  const endL = Math.min(L, s * 0.45);
-  for (let j = 0; j < samples.length; j += 6) {
-    const x = samples[j]!;
-    const y = samples[j + 1]!;
-    const at = samples[j + 5]!;
-    let [r, a, b] = shape(tool, width, samples[j + 2]!, samples[j + 3]!, samples[j + 4]!);
-    if (tapered) r *= ease(at / L) * ease((s - at) / Math.max(endL, 1e-3));
+}
+
+const cursorAtStart = (stroke: Stroke) => ({ x: stroke.points[0] ?? 0, y: stroke.points[1] ?? 0, at: 0 });
+type Cursor = ReturnType<typeof cursorAtStart>;
+const emptyBounds = (): Bounds => ({ minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+
+function advance(cursor: Cursor, x: number, y: number) {
+  cursor.at += Math.hypot(x - cursor.x, y - cursor.y);
+  cursor.x = x;
+  cursor.y = y;
+}
+
+function taperedLength(stroke: Stroke): number | undefined {
+  const count = stroke.points.length / STRIDE;
+  if (stroke.shape || !tapers(stroke.tool) || count < 2) return;
+  const cursor = cursorAtStart(stroke);
+  readings(stroke, 0, count, (x, y) => advance(cursor, x, y));
+  return cursor.at;
+}
+
+function traceRange(
+  stroke: Stroke,
+  from: number,
+  to: number,
+  length: number | undefined,
+  cursor: Cursor,
+  out: Trace,
+  bounds?: Bounds,
+) {
+  const L = taperLength(stroke.width);
+  const endL = Math.max(1e-3, Math.min(L, (length ?? 0) * 0.45));
+  readings(stroke, from, to, (x, y, pressure, tx, ty) => {
+    advance(cursor, x, y);
+    const at = cursor.at;
+    let [r, a, b] = shape(stroke.tool, stroke.width, pressure, tx, ty);
+    if (length !== undefined) r *= ease(at / L) * ease((length - at) / endL);
     out(x, y, r, a, b, at);
-    bounds.minX = Math.min(bounds.minX, x - r);
-    bounds.minY = Math.min(bounds.minY, y - r);
-    bounds.maxX = Math.max(bounds.maxX, x + r);
-    bounds.maxY = Math.max(bounds.maxY, y + r);
+    if (bounds) {
+      bounds.minX = Math.min(bounds.minX, x - r);
+      bounds.minY = Math.min(bounds.minY, y - r);
+      bounds.maxX = Math.max(bounds.maxX, x + r);
+      bounds.maxY = Math.max(bounds.maxY, y + r);
+    }
+  });
+}
+
+/** Walks the finished outline with the taper measured along its full smoothed path. */
+export function trace(stroke: Stroke, out: Trace): Bounds {
+  const bounds = emptyBounds();
+  traceRange(stroke, 0, stroke.points.length / STRIDE, taperedLength(stroke), cursorAtStart(stroke), out, bounds);
+  return bounds;
+}
+
+/** Keep each ribbon's curve neighbors, distance, and pending join across independently rebuildable mesh pages. */
+export function tessellatePages(
+  stroke: Stroke,
+  scratch: Mesh,
+  emit: (rebuild: (target: Mesh) => void) => void,
+): Bounds {
+  const count = stroke.points.length / STRIDE;
+  const ribbonTool = ["pen", "pencil", "brush", "marker", "eraser"].includes(stroke.tool);
+  if (stroke.patch || !ribbonTool || count <= RIBBON_PAGE_POINTS) {
+    const rebuild = (target: Mesh) => {
+      target.reset();
+      return tessellate(stroke, target);
+    };
+    const bounds = rebuild(scratch);
+    emit(rebuild);
+    return bounds;
+  }
+  const bounds = emptyBounds(),
+    length = taperedLength(stroke);
+  const ribbon = new Ribbon(scratch),
+    cursor = cursorAtStart(stroke);
+  for (let from = 0; from < count; from += RIBBON_PAGE_POINTS) {
+    const to = Math.min(count, from + RIBBON_PAGE_POINTS);
+    const startRibbon = ribbon.clone(scratch),
+      startCursor = { ...cursor };
+    const render = (r: Ribbon, c: Cursor, b?: Bounds) => {
+      r.mesh.reset();
+      r.mesh.style(stroke);
+      traceRange(stroke, from, to, length, c, (x, y, radius, a, shade, at) => r.push(x, y, radius, a, shade, at), b);
+      if (to === count) r.finish();
+    };
+    render(ribbon, cursor, bounds);
+    emit((target) => render(startRibbon.clone(target), { ...startCursor }));
   }
   return bounds;
 }
@@ -467,7 +529,10 @@ export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
     return bounds;
   }
   if (stroke.tool === "bucket" || stroke.tool === "lasso-fill") {
-    if (polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0), 300000) > 300000)
+    if (
+      polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0), MAX_FILL_VERTICES) >
+      MAX_FILL_VERTICES
+    )
       throw new Error("This fill has too many intersecting edges.");
     return pathBounds(stroke);
   }

@@ -2,7 +2,7 @@ import type { BlendMode, Layer, Paper, RasterPatch, Stroke } from "./model";
 import type { View } from "./renderer";
 import { coordinate16, fraction16, pressure12 } from "./precision";
 import { pigmentDabCount } from "./pigments";
-import { estimateStrokeVertices } from "./ink";
+import { estimateStrokeVertices, MAX_FILL_VERTICES } from "./ink";
 import { Writer, Reader, LayerTable, LIMITS, bad, crc32 } from "./eventBinary";
 import { WIRE } from "./eventIds";
 
@@ -14,8 +14,8 @@ export interface Budget {
   records: number;
   copies: number;
   removed: number;
-  vertices: number;
-  vertexCosts: Map<number, number>;
+  copyVertices: number;
+  vertexCosts: Map<number, Stroke | number>;
 }
 export const budget = (): Budget => ({
   points: LIMITS.points,
@@ -25,24 +25,28 @@ export const budget = (): Budget => ({
   records: LIMITS.events,
   copies: LIMITS.strokes,
   removed: LIMITS.removed,
-  vertices: LIMITS.vertices,
+  copyVertices: LIMITS.copyVertices,
   vertexCosts: new Map(),
 });
 export interface Context {
   table: LayerTable;
   budget: Budget;
 }
-function chargeVertices(ctx: Context, seq: number, count: number) {
-  if (!Number.isFinite(count) || count > Math.min(ctx.budget.vertices, LIMITS.verticesPerStroke))
-    bad("stroke geometry exceeds the playback vertex budget");
-  ctx.budget.vertices -= count;
-  // History can restore earlier geometry under the same sequence number. Charge references for its largest incarnation.
-  ctx.budget.vertexCosts.set(seq, Math.max(count, ctx.budget.vertexCosts.get(seq) ?? 0));
+const vertexCost = (source: Stroke | number) =>
+  typeof source === "number" ? source : estimateStrokeVertices(source, LIMITS.copyVertices);
+function recordSource(ctx: Context, seq: number, source: Stroke | number) {
+  // History can restore different geometry under a sequence number. Bound copies by its largest incarnation.
+  const previous = ctx.budget.vertexCosts.get(seq);
+  ctx.budget.vertexCosts.set(seq, previous === undefined ? source : Math.max(vertexCost(previous), vertexCost(source)));
 }
 export function chargeCopy(ctx: Context, source: number, result: number) {
-  const count = ctx.budget.vertexCosts.get(source);
-  if (count === undefined) return bad("copy refers to an unknown stroke");
-  chargeVertices(ctx, result, count);
+  const original = ctx.budget.vertexCosts.get(source);
+  if (original === undefined) return bad("copy refers to an unknown stroke");
+  const cost = vertexCost(original);
+  if (cost > ctx.budget.copyVertices) bad("stroke references exceed the playback vertex budget");
+  ctx.budget.copyVertices -= cost;
+  ctx.budget.vertexCosts.set(source, cost);
+  recordSource(ctx, result, cost);
 }
 export function enumerate<K extends string>(table: Readonly<Record<K, number>>, id: number): K {
   for (const name in table) if (table[name] === id) return name;
@@ -322,7 +326,13 @@ function readStroke(r: Reader, ctx: Context): Stroke {
     if (used > remaining) bad("pigment budget exceeded");
     ctx.budget.dabs -= used;
   }
-  chargeVertices(ctx, seq, estimateStrokeVertices(s, Math.min(LIMITS.verticesPerStroke, ctx.budget.vertices)));
+  if (
+    (tool === "bucket" || tool === "lasso-fill") &&
+    !s.patch &&
+    estimateStrokeVertices(s, MAX_FILL_VERTICES) > MAX_FILL_VERTICES
+  )
+    bad("fill has too many intersecting edges");
+  recordSource(ctx, seq, s);
   return s;
 }
 export function strokes(w: Writer, list: readonly Stroke[]) {

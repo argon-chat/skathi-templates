@@ -264,14 +264,29 @@ test("point columns retain 12-bit pressure and encode time from the start of eac
   ]);
 });
 
-test("bounds curve expansion and charges reference-only copies for their source geometry", async () => {
+test("accepts long curves and charges reference-only copies for their source geometry", async () => {
   const long = (count: number) => {
     const points: number[] = [];
     for (let i = 0; i < count; i++) points.push(i * 150, 0, 1, 0, 0, 0, i * 10);
     return { ...fixtureStrokes[1]!, points };
   };
   const oversized = await eventsChunk([{ kind: "stroke", layer: "layer-1", strokes: [long(1500)], at: 50 }], 0);
-  await expect(decodeRecording(joinBytes([...prefix(), oversized]))).rejects.toThrow("vertex");
+  const decoded = await decodeRecording(joinBytes([...prefix(), oversized]));
+  const strokes = decoded.events[0];
+  expect(strokes?.kind === "stroke" && strokes.strokes[0]!.points).toEqual(long(1500).points);
+  // More than 20M generated vertices across edits, with just one stroke on the canvas at a time.
+  const dense = long(1500);
+  const edits = Array.from({ length: 50 }, (_, i) => ({
+    kind: "edit" as const,
+    layer: "layer-1",
+    removed: i ? [i] : [],
+    added: [{ ...dense, seq: i + 1 }],
+    at: i,
+  }));
+  const history = await decodeRecording(joinBytes([...prefix(), await eventsChunk(edits, 0)]));
+  const final = new PlaybackTimeline(history).final;
+  expect(final.layers[0]!.strokes.map((s) => s.seq)).toEqual([50]);
+  expect(final.layers[0]!.strokes[0]!.points).toEqual(dense.points);
   const original = long(180);
   const copies = Array.from({ length: 1500 }, (_, i) => ({ layer: "layer-1", seq: original.seq, as: 1000 + i }));
   const amplified = await eventsChunk(

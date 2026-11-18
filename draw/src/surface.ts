@@ -17,7 +17,7 @@ import {
   translate,
   union,
 } from "./geometry";
-import { LiveShape, LiveStroke, Stabilizer } from "./ink";
+import { LiveShape, LiveStroke, Stabilizer, VERTEX_BYTES } from "./ink";
 import {
   hex,
   INK,
@@ -1179,7 +1179,7 @@ export function useSurface(o: Options) {
         if (visited.has(stroke) || stroke.patch) continue;
         visited.add(stroke);
         if (remaining <= 0 || stroke.points.length > STRIDE * 4096) break;
-        remaining -= meshOf(stroke).bytes.byteLength;
+        remaining -= meshOf(stroke).vertices * VERTEX_BYTES;
         if (performance.now() - since > 8) {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
           if (!isCurrent()) return;

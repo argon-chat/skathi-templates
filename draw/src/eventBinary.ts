@@ -15,8 +15,7 @@ export const LIMITS = {
   symbols: 65_536,
   string: 4096,
   dabs: 2_000_000,
-  vertices: 20_000_000,
-  verticesPerStroke: 300_000,
+  copyVertices: 20_000_000,
 } as const;
 export const bad = (why: string): never => {
   throw new Error(`Invalid SKEV recording (${why}).`);

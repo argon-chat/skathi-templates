@@ -11,7 +11,7 @@ import {
   type PixelRect,
 } from "./smudge";
 import { IDENTITY, union, type Affine } from "./geometry";
-import { type Bounds, type LiveSource, Mesh, tessellate, VERTEX_BYTES } from "./ink";
+import { type Bounds, type LiveSource, Mesh, tessellate, tessellatePages, VERTEX_BYTES } from "./ink";
 import { BLEND_MODES, INK, PAPER, rgb, STRIDE, type RasterPatch, type Layer, type Paper, type Stroke } from "./model";
 import { compositeShader, strokeShader } from "./shaders";
 
@@ -30,9 +30,9 @@ const PATTERN: Record<Paper, { mode: number; spacing: number }> = {
 };
 
 interface Cached {
-  bytes: Uint8Array;
   vertices: number;
   bounds: Bounds;
+  copyTo(destination: Uint8Array, from: number, to: number, offset: number): void;
 }
 
 const CPU_CACHE_BYTES = 176 * 1024 * 1024;
@@ -40,9 +40,15 @@ const GPU_CACHE_BYTES = 192 * 1024 * 1024;
 const LAYER_CACHE_BYTES = 64 * 1024 * 1024;
 const PAGE_VERTICES = 131070;
 interface CacheSlot {
-  mesh?: Cached;
+  bytes?: Uint8Array;
 }
-const meshes = new WeakMap<Stroke, CacheSlot>();
+interface MeshPage {
+  end: number;
+  slot: CacheSlot;
+  rebuild: (target: Mesh) => void;
+}
+const meshes = new WeakMap<Stroke, Cached>();
+// Slots held here contain only bytes, so the LRU never retains discarded strokes or their rebuild functions.
 const recent = new Set<CacheSlot>();
 let retainedBytes = 0;
 class DrawingCommands {
@@ -58,29 +64,70 @@ class DrawingCommands {
 
 const scratch = new Mesh(1 << 16);
 
-/** A stroke's triangles, tessellated the first time they are asked for. */
-export function meshOf(stroke: Stroke): Cached {
-  const slot = meshes.get(stroke) ?? {};
-  if (slot.mesh) {
-    recent.delete(slot);
-    recent.add(slot);
-    return slot.mesh;
+function retain(slot: CacheSlot, bytes: Uint8Array) {
+  if (!bytes.length || bytes.length > CPU_CACHE_BYTES) return;
+  while (retainedBytes + bytes.length > CPU_CACHE_BYTES || recent.size >= 32000) {
+    const oldest = recent.values().next().value;
+    if (!oldest) break;
+    retainedBytes -= oldest.bytes!.length;
+    delete oldest.bytes;
+    recent.delete(oldest);
   }
-  scratch.reset();
-  const bounds = tessellate(stroke, scratch);
-  const mesh = { bytes: scratch.view().slice(), vertices: scratch.count, bounds };
-  if (!mesh.bytes.length || mesh.bytes.length > CPU_CACHE_BYTES) return mesh;
-  while ((retainedBytes + mesh.bytes.length > CPU_CACHE_BYTES || recent.size >= 32000) && recent.size) {
-    const first = recent.values().next();
-    if (first.done) break;
-    retainedBytes -= first.value.mesh!.bytes.length;
-    delete first.value.mesh;
-    recent.delete(first.value);
-  }
-  slot.mesh = mesh;
-  meshes.set(stroke, slot);
+  retainedBytes += bytes.length;
   recent.add(slot);
-  retainedBytes += mesh.bytes.length;
+  slot.bytes = bytes;
+}
+
+function pageBytes(page: MeshPage) {
+  if (page.slot.bytes) {
+    recent.delete(page.slot);
+    recent.add(page.slot);
+    return page.slot.bytes;
+  }
+  page.rebuild(scratch);
+  const bytes = scratch.view().slice();
+  retain(page.slot, bytes);
+  return bytes;
+}
+
+/** Cache independently recoverable geometry pages; a single long stroke can exceed the entire cache. */
+export function meshOf(stroke: Stroke): Cached {
+  const existing = meshes.get(stroke);
+  if (existing) return existing;
+  const pages: MeshPage[] = [];
+  let vertices = 0;
+  const bounds = tessellatePages(stroke, scratch, (rebuild) => {
+    if (!scratch.count) return;
+    vertices += scratch.count;
+    const slot: CacheSlot = {};
+    retain(slot, scratch.view().slice());
+    pages.push({ end: vertices, slot, rebuild });
+  });
+  const mesh: Cached = {
+    bounds,
+    vertices,
+    copyTo(destination, from, to, offset) {
+      let lo = 0,
+        hi = pages.length;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if (pages[mid]!.end <= from) lo = mid + 1;
+        else hi = mid;
+      }
+      for (let i = lo; from < to; i++) {
+        const page = pages[i]!,
+          start = i ? pages[i - 1]!.end : 0,
+          end = Math.min(to, page.end);
+        destination.set(
+          pageBytes(page).subarray((from - start) * VERTEX_BYTES, (end - start) * VERTEX_BYTES),
+          offset * VERTEX_BYTES,
+        );
+        offset += end - from;
+        from = end;
+      }
+    },
+  };
+  meshes.set(stroke, mesh);
   return mesh;
 }
 
@@ -1378,10 +1425,7 @@ export class Renderer {
         last = Math.min(end, gpu.ends[i]!);
       if (last <= start) continue;
       const mesh = meshOf(gpu.strokes[i]!);
-      page.set(
-        mesh.bytes.subarray((start - first) * VERTEX_BYTES, (last - first) * VERTEX_BYTES),
-        offset * VERTEX_BYTES,
-      );
+      mesh.copyTo(page, start - first, last - first, offset);
       offset += last - start;
       start = last;
     }

@@ -1,7 +1,8 @@
 import { expect, test } from "bun:test";
+import { meshOf } from "../src/renderer";
 import { floodContours } from "../src/bucket";
 import { insidePolygon, transformStroke, translate } from "../src/geometry";
-import { estimateStrokeVertices, LiveStroke, Mesh, tessellate } from "../src/ink";
+import { estimateStrokeVertices, LiveStroke, Mesh, tessellate, tessellatePages, VERTEX_BYTES } from "../src/ink";
 import { TOOLS, type Stroke } from "../src/model";
 import { dabStream, polygonMesh, type Dab } from "../src/pigments";
 import { SmudgeSession, drawingPixels } from "../src/smudge";
@@ -45,6 +46,51 @@ test("spray and airbrush keep depositing while still, with identical live and co
       const other = new Mesh();
       tessellate({ ...s, seed: 124 }, other);
       expect(other.view()).not.toEqual(committed.view());
+    }
+  }
+});
+
+test("long pencil and brush ribbons preserve every vertex, including pressure, taper and joins across pages", () => {
+  for (const tool of ["pencil", "brush"] as const) {
+    const s = stroke(tool);
+    s.points = [];
+    for (let i = 0; i < 1500; i++) {
+      const x = 200 + 160 * Math.sin(i * 0.8),
+        y = 240 + 180 * Math.cos(i * 0.7);
+      s.points.push(x, y, 0.1 + (i % 10) * 0.1, i % 65, i % 30, 0, i * 5);
+    }
+    const reference = new Mesh(),
+      page = new Mesh();
+    const expected = tessellate(s, reference);
+    const bytes = Buffer.from(reference.view().buffer, 0, reference.count * VERTEX_BYTES);
+    expect(reference.count).toBeGreaterThan(300000);
+    let at = 0;
+    const pages: { start: number; end: number; rebuild: (m: Mesh) => void }[] = [];
+    const bounds = tessellatePages(s, page, (rebuild) => {
+      const end = at + page.count * VERTEX_BYTES;
+      expect(page.count).toBeLessThan(60000);
+      expect(bytes.subarray(at, end).equals(page.view())).toBe(true);
+      pages.push({ start: at, end, rebuild });
+      at = end;
+    });
+    expect(at).toBe(bytes.length);
+    expect(bounds).toEqual(expected);
+    const cached = meshOf(s);
+    const upload = new Uint8Array(131070 * VERTEX_BYTES);
+    for (let to = cached.vertices; to > 0;) {
+      const offset = 3,
+        from = Math.max(0, to - (131070 - offset));
+      cached.copyTo(upload, from, to, offset);
+      expect(
+        bytes
+          .subarray(from * VERTEX_BYTES, to * VERTEX_BYTES)
+          .equals(upload.subarray(offset * VERTEX_BYTES, (to - from + offset) * VERTEX_BYTES)),
+      ).toBe(true);
+      to = from;
+    }
+    for (const part of pages.reverse()) {
+      part.rebuild(page);
+      expect(bytes.subarray(part.start, part.end).equals(page.view())).toBe(true);
     }
   }
 });
