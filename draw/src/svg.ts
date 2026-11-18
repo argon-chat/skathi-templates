@@ -1,5 +1,5 @@
 import { dabStream, strokeRings } from "./pigments";
-import { pngData, smudgedPixels } from "./smudge";
+import { pngData, smudgedPixels, unpackPixels } from "./smudge";
 import { STRIDE } from "./model";
 import type { Bounds } from "./geometry";
 import { trace } from "./ink";
@@ -91,6 +91,7 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
   }
   const area = `x="${n(minX)}" y="${n(minY)}" width="${n(w)}" height="${n(h)}"`;
   let below: string | null = null;
+  let opaqueFilter = false;
   const mask = (body: string, alpha = false) => {
     const id = `mask-${++masks}`;
     defs.push(
@@ -124,7 +125,12 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
         content = `<g mask="url(#${id})">${content}</g><image ${attrs} href="${await pngData(result.pixels, result.w, result.h)}"/>`;
         continue;
       }
-      if (stroke.tool === "spray" || stroke.tool === "airbrush") {
+      if (stroke.tool === "bucket" && stroke.patch) {
+        const p = stroke.patch;
+        const attrs = `x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}"${p.transform ? ` transform="matrix(${p.transform.join(" ")})"` : ""}`;
+        const rgba = new Uint8ClampedArray(unpackPixels(p.rgba).buffer);
+        mark = `<image ${attrs} opacity="${n(stroke.opacity ?? 1)}" href="${await pngData(rgba, p.width, p.height)}"/>`;
+      } else if (stroke.tool === "spray" || stroke.tool === "airbrush") {
         const add = dabStream(stroke);
         let paint = fill;
         if (stroke.tool === "airbrush") {
@@ -171,7 +177,13 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
         const base = `prior-${++masks}`;
         defs.push(`<g id="${base}">${content}</g>`);
         const id = mask(`<use href="#${base}"/>`, true);
-        content = `<use href="#${base}"/><g mask="url(#${id})">${mark}</g>`;
+        if (!opaqueFilter) {
+          defs.push(
+            `<filter id="opaque-ink" filterUnits="userSpaceOnUse" ${area} color-interpolation-filters="sRGB"><feComponentTransfer><feFuncA type="linear" slope="0" intercept="1"/></feComponentTransfer></filter>`,
+          );
+          opaqueFilter = true;
+        }
+        content = `<g mask="url(#${id})"><use href="#${base}" filter="url(#opaque-ink)"/>${mark}</g>`;
       } else content += mark;
     }
     if (layer.clipping) {
@@ -187,7 +199,7 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
     const blend = layer.blendMode === "add" ? "plus-lighter" : layer.blendMode;
     const style = blend && blend !== "normal" ? ` style="mix-blend-mode:${blend}"` : "";
     defs.push(`<g id="${id}"${opacity}>${content}</g>`);
-    body.push(`<use id="${escape(layer.id)}" data-name="${escape(layer.name)}" href="#${id}"${style}/>`);
+    body.push(`<use data-layer-id="${escape(layer.id)}" data-name="${escape(layer.name)}" href="#${id}"${style}/>`);
     below = id;
   }
   return (

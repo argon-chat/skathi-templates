@@ -38,7 +38,7 @@ import {
 } from "./model";
 import { Marks, type Rgba } from "./overlay";
 import { meshOf, Renderer, type View } from "./renderer";
-import type { DrawRecording, DrawMutation } from "./events";
+import type { DrawAtomic, DrawRecording, DrawMutation } from "./events";
 import type { useSketchbook } from "./sketchbook";
 
 const BARREL = 2;
@@ -189,6 +189,7 @@ export function useSurface(o: Options) {
   }
 
   function setView(next: View) {
+    if (view.x === next.x && view.y === next.y && view.zoom === next.zoom && view.angle === next.angle) return;
     view = next;
     renderer?.setView(view);
     if (next.zoom !== zoom.value) zoom.value = next.zoom;
@@ -253,6 +254,7 @@ export function useSurface(o: Options) {
   }
 
   function theme() {
+    if (playback) return;
     const m = o.dark.value ? "dark" : "light";
     renderer?.setTheme(rgbUnit(PAPER[m]), rgbUnit(INK[m]), o.paper.value, o.dark.value ? 0.16 : 0.2);
   }
@@ -392,6 +394,37 @@ export function useSurface(o: Options) {
       if (!playback && activeLayer() === layer && result.length) book.addStrokes(result);
     } catch (e) {
       o.notify(e instanceof Error ? e.message : "Could not sample this layer");
+    } finally {
+      processing = false;
+    }
+  }
+
+  async function mergeDown(id: string) {
+    if (processing || playback || drawing.value) return;
+    const i = book.layers.value.findIndex((l) => l.id === id);
+    const upper = book.layers.value[i],
+      lower = book.layers.value[i - 1];
+    if (!upper || !lower || !renderer) return;
+    const isolated =
+      !!upper.clipping ||
+      (upper.blendMode ?? "normal") !== "normal" ||
+      (lower.blendMode ?? "normal") !== "normal" ||
+      lower.opacity !== 1 ||
+      upper.opacity !== 1 ||
+      !lower.visible ||
+      !upper.visible ||
+      upper.strokes.some((s) => s.tool === "eraser" || s.alphaLocked || !!s.patch);
+    if (!isolated) {
+      book.mergeDown(id);
+      return;
+    }
+    processing = true;
+    try {
+      const merged = await renderer.mergeLayers(lower, upper, book.nextSeq());
+      const current = book.layers.value.findIndex((l) => l === upper);
+      if (!playback && current > 0 && book.layers.value[current - 1] === lower) book.mergeDown(id, merged);
+    } catch (e) {
+      o.notify(e instanceof Error ? e.message : "Could not merge these layers.");
     } finally {
       processing = false;
     }
@@ -1104,6 +1137,7 @@ export function useSurface(o: Options) {
       renderer?.setLayers(book.layers.value);
       theme();
     },
+    mergeDown,
     painting: () => drawing.value || processing,
     enableInput(value: boolean) {
       inputsEnabled = value;
@@ -1122,14 +1156,18 @@ export function useSurface(o: Options) {
       return g === gesture && strokes.length ? { kind: "stroke", layer: layer.id, strokes } : null;
     },
     async preparePlayback(file: DrawRecording, isCurrent: () => boolean) {
+      function* members(m: DrawAtomic) {
+        if (m.kind === "stroke") yield* m.strokes;
+        else if (m.kind === "edit") yield* m.added;
+        else if (m.kind === "add-layer") yield* m.layer.strokes;
+        else if (m.kind === "replace") for (const l of m.layers) yield* l.strokes;
+      }
       function* geometry() {
         for (const l of file.initial?.layers ?? []) yield* l.strokes;
         for (const e of file.events) {
           const m = e.kind === "undo" || e.kind === "redo" ? e.fallback : e;
-          if (m?.kind === "stroke") yield* m.strokes;
-          else if (m?.kind === "edit") yield* m.added;
-          else if (m?.kind === "add-layer") yield* m.layer.strokes;
-          else if (m?.kind === "replace") for (const l of m.layers) yield* l.strokes;
+          if (m?.kind === "group") for (const change of m.changes) yield* members(change);
+          else if (m && m.kind !== "ui" && m.kind !== "view") yield* members(m);
         }
       }
       let since = performance.now();

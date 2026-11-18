@@ -104,6 +104,15 @@ fn eraser(i: Ink) -> vec4f {
   return pen(i);
 }
 
+@group(2) @binding(0) var<storage,read> raster:array<u32>;
+
+@fragment fn fs_image(i:Ink)->@location(0) vec4f {
+  let dim=vec2u(raster[0],raster[1]);
+  let p=min(vec2u(max(i.along,vec2f(0))),dim-vec2u(1));
+  let c=unpack4x8unorm(raster[2u+p.y*dim.x+p.x]);
+  return premultiply(c.rgb,c.a*i.color.a);
+}
+
 @fragment fn fs_spray(i:Ink)->@location(0) vec4f {
   return premultiply(i.color.rgb,coverage(length(i.along))*i.color.a*i.density);
 }

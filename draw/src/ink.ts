@@ -389,6 +389,29 @@ export function trace(stroke: Stroke, out: Trace): Bounds {
 /** The whole stroke, end taper included: what is stored on the GPU once committed. */
 export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
   mesh.style(stroke);
+  if (stroke.tool === "bucket" && stroke.patch) {
+    const patch = stroke.patch,
+      m = patch.transform ?? IDENTITY;
+    const bounds: Bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
+    for (const [u, v] of [
+      [0, 0],
+      [1, 0],
+      [0, 1],
+      [0, 1],
+      [1, 0],
+      [1, 1],
+    ] as const) {
+      const x = u * patch.width,
+        y = v * patch.height;
+      const q = apply(m, patch.x + x, patch.y + y);
+      mesh.vertex(q.x, q.y, 0, 1, 0, x, y);
+      bounds.minX = Math.min(bounds.minX, q.x);
+      bounds.maxX = Math.max(bounds.maxX, q.x);
+      bounds.minY = Math.min(bounds.minY, q.y);
+      bounds.maxY = Math.max(bounds.maxY, q.y);
+    }
+    return bounds;
+  }
   if (stroke.tool === "bucket" || stroke.tool === "lasso-fill") {
     polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0));
     return pathBounds(stroke);

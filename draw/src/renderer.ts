@@ -1,6 +1,6 @@
 import { BlendPass } from "./blend";
 import { floodContours, type BucketOptions } from "./bucket";
-import { base64 } from "./smudge";
+import { base64, unpackPixels } from "./smudge";
 import { pathBounds } from "./pigments";
 import { IDENTITY, union, type Affine } from "./geometry";
 import { type Bounds, type LiveSource, Mesh, tessellate, VERTEX_BYTES } from "./ink";
@@ -54,10 +54,12 @@ type Key =
   | "eraser+"
   | "spray"
   | "airbrush"
-  | "smudge";
+  | "smudge"
+  | "image";
 
 function keyOf(stroke: Stroke): Key {
   const t = stroke.tool;
+  if (t === "bucket" && stroke.patch) return "image";
   if (t === "marker" || t === "pencil" || t === "spray" || t === "airbrush" || t === "smudge") return t;
   if (t === "bucket" || t === "lasso-fill") return "pen";
   return (stroke.opacity ?? 1) < 1 ? `${t}+` : t;
@@ -68,6 +70,7 @@ const instanceKey = (key: Key) => key === "spray" || key === "airbrush";
 interface Run {
   locked: boolean;
   key: Key;
+  image?: { group: GPUBindGroup; buffer: GPUBuffer };
   first: number;
   count: number;
 }
@@ -97,6 +100,7 @@ class LayerGpu {
 
   destroy() {
     this.buffer?.destroy();
+    for (const run of this.runs) run.image?.buffer.destroy();
     this.target?.texture.destroy();
     this.opacityBuffer.destroy();
   }
@@ -116,6 +120,8 @@ export interface Render {
   /** Paints the paper's dots or lines. */
   pattern: boolean;
   layer?: string;
+  rawLayer?: boolean;
+  pair?: readonly [Layer, Layer];
 }
 
 type Rgb = readonly [number, number, number];
@@ -173,6 +179,7 @@ export class Renderer {
   private readonly screen: Composites;
   private offscreen: Composites | null = null;
   private blend: BlendPass | null = null;
+  private readonly rasterLayout: GPUBindGroupLayout;
   private readonly textureLayout: GPUBindGroupLayout;
   private readonly viewLayout: GPUBindGroupLayout;
   private readonly modelLayout: GPUBindGroupLayout;
@@ -200,6 +207,9 @@ export class Renderer {
     });
     this.modelLayout = device.createBindGroupLayout({
       entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: "uniform" } }],
+    });
+    this.rasterLayout = device.createBindGroupLayout({
+      entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, buffer: { type: "read-only-storage" } }],
     });
     this.textureLayout = device.createBindGroupLayout({
       entries: [
@@ -456,7 +466,10 @@ export class Renderer {
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
     });
     const composite = (this.offscreen ??= this.composites(LAYER_FORMAT));
-    const blend = !options.layer && this.needsBlend ? new BlendPass(device, w, h) : null;
+    const blend = options.pair || (!options.layer && this.needsBlend) ? new BlendPass(device, w, h) : null;
+    const lowerParams = options.pair ? this.uniformBuffer(16) : null;
+    if (lowerParams && options.pair)
+      device.queue.writeBuffer(lowerParams, 0, new Float32Array([options.pair[0].opacity, 0, 0, 0]));
     const stride = Math.ceil((w * 4) / 256) * 256;
     const readback = device.createBuffer({
       size: stride * h,
@@ -476,8 +489,8 @@ export class Renderer {
       base.draw(3);
     }
     base.end();
-    const glow = options.background && this.dark;
-    for (const l of this.order) {
+    const glow = (options.background || !!options.pair || !!options.layer) && this.dark;
+    for (const l of options.pair ?? this.order) {
       const gpu = this.layers.get(l.id);
       if (!gpu) continue;
       if (!l.visible || !gpu.vertices) {
@@ -487,7 +500,7 @@ export class Renderer {
       if (options.layer && l.id !== options.layer) continue;
       this.drawLayer(encoder, gpu, l.id, layerView, msaa.view, depth.view, group, false, glow);
       if (blend) {
-        blend.layer(encoder, layerView, gpu.opacityBuffer);
+        blend.layer(encoder, layerView, (l === options.pair?.[0] ? lowerParams : null) ?? gpu.opacityBuffer);
         continue;
       }
       const pass = encoder.beginRenderPass({
@@ -495,7 +508,7 @@ export class Renderer {
       });
       pass.setBindGroup(0, group);
       pass.setPipeline(composite.layer);
-      pass.setBindGroup(1, this.layerGroup(layerView, options.layer ? this.fullOpacity : gpu.opacityBuffer));
+      pass.setBindGroup(1, this.layerGroup(layerView, options.rawLayer ? this.fullOpacity : gpu.opacityBuffer));
       pass.draw(3);
       pass.end();
     }
@@ -530,6 +543,7 @@ export class Renderer {
       }
       return { pixels, w, h };
     } finally {
+      lowerParams?.destroy();
       blend?.destroy();
       for (const t of [msaa.texture, depth.texture, layer, out]) t.destroy();
       readback.destroy();
@@ -594,6 +608,39 @@ export class Renderer {
     }
   }
 
+  async mergeLayers(lower: Layer, upper: Layer, seq: number): Promise<Layer> {
+    const merged: Layer = { ...lower, visible: lower.visible || upper.visible, opacity: 1, strokes: [] };
+    let b: Bounds | null = null;
+    for (const l of [lower, upper]) if (l.visible) for (const s of l.strokes) b = union(b, meshOf(s).bounds);
+    if (!b) return merged;
+    const bounds = {
+      minX: Math.floor(b.minX) - 1,
+      minY: Math.floor(b.minY) - 1,
+      maxX: Math.ceil(b.maxX) + 1,
+      maxY: Math.ceil(b.maxY) + 1,
+    };
+    const w = bounds.maxX - bounds.minX,
+      h = bounds.maxY - bounds.minY;
+    if (w > MAX_EXPORT || h > MAX_EXPORT || w * h > 16_777_216)
+      throw new Error("These layers are too large to merge at document resolution.");
+    const image = await this.render(bounds, 1, { pair: [lower, upper], background: false, pattern: false });
+    const { minX: x, minY: y, maxX: maxX, maxY: maxY } = bounds;
+    const points = [x, y, 1, 0, 0, 0, 0, maxX, y, 1, 0, 0, 0, 0, maxX, maxY, 1, 0, 0, 0, 0, x, maxY, 1, 0, 0, 0, 0];
+    return {
+      ...merged,
+      strokes: [
+        {
+          seq,
+          tool: "bucket",
+          color: "ink",
+          width: 1,
+          points,
+          patch: { x, y, width: w, height: h, rgba: base64(image.pixels) },
+        },
+      ],
+    };
+  }
+
   async smudge(stroke: Stroke, layer: string): Promise<Stroke> {
     const b = pathBounds(stroke, stroke.width / 2 + 2);
     const bounds = {
@@ -606,7 +653,7 @@ export class Renderer {
       h = bounds.maxY - bounds.minY;
     if (w > MAX_EXPORT || h > MAX_EXPORT || w * h > 16_777_216)
       throw new Error("This smudge is too large for a document-resolution sample.");
-    const image = await this.render(bounds, 1, { background: false, pattern: false, layer });
+    const image = await this.render(bounds, 1, { background: false, pattern: false, layer, rawLayer: true });
     return { ...stroke, patch: { x: bounds.minX, y: bounds.minY, width: w, height: h, rgba: base64(image.pixels) } };
   }
 
@@ -775,6 +822,7 @@ export class Renderer {
     pass.setVertexBuffer(0, gpu.buffer);
     for (const run of gpu.runs) {
       pass.setPipeline(this.pipeline(run.key, glow, run.locked));
+      if (run.image) pass.setBindGroup(2, run.image.group);
       if (instanceKey(run.key)) pass.draw(6, run.count, 0, run.first);
       else pass.draw(run.count, 1, run.first);
     }
@@ -799,7 +847,7 @@ export class Renderer {
     const added = strokes.slice(same).map(meshOf);
     const total = gpu.vertices + added.reduce((sum, m) => sum + m.vertices, 0);
     this.reserve(gpu, total * VERTEX_BYTES);
-    while (gpu.runs.length && gpu.runs.at(-1)!.first >= gpu.vertices) gpu.runs.pop();
+    while (gpu.runs.length && gpu.runs.at(-1)!.first >= gpu.vertices) gpu.runs.pop()!.image?.buffer.destroy();
     const tail = gpu.runs.at(-1);
     if (tail) tail.count = gpu.vertices - tail.first;
     let first = gpu.vertices;
@@ -811,7 +859,23 @@ export class Renderer {
       const key = keyOf(stroke),
         locked = stroke.alphaLocked ?? false;
       const last = gpu.runs.at(-1);
-      if (last && last.key === key && last.locked === locked) last.count += mesh.vertices;
+      if (key === "image" && stroke.patch) {
+        const patch = stroke.patch;
+        const pixels = unpackPixels(patch.rgba);
+        const buffer = this.device.createBuffer({
+          size: 8 + pixels.byteLength,
+          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+        });
+        this.device.queue.writeBuffer(buffer, 0, new Uint32Array([patch.width, patch.height]));
+        this.device.queue.writeBuffer(buffer, 8, pixels);
+        gpu.runs.push({
+          key,
+          locked,
+          first,
+          count: mesh.vertices,
+          image: { buffer, group: this.groupFor(this.rasterLayout, buffer) },
+        });
+      } else if (last && last.key === key && last.locked === locked) last.count += mesh.vertices;
       else if (mesh.vertices) gpu.runs.push({ key, locked, first, count: mesh.vertices });
       first += mesh.vertices;
       gpu.strokes.push(stroke);
@@ -908,7 +972,12 @@ export class Renderer {
     const replace = { srcFactor: "one", dstFactor: "zero" } as const;
     const make = (entryPoint: string, color: GPUBlendComponent, layered: boolean, alpha = color, instances = false) =>
       this.device.createRenderPipeline({
-        layout,
+        layout:
+          entryPoint === "fs_image"
+            ? this.device.createPipelineLayout({
+                bindGroupLayouts: [this.viewLayout, this.modelLayout, this.rasterLayout],
+              })
+            : layout,
         vertex: {
           module,
           entryPoint: instances ? "vs_dab" : "vs",
@@ -948,6 +1017,7 @@ export class Renderer {
         multisample: { count: SAMPLES },
       });
     return {
+      image: make("fs_image", over, false),
       spray: make("fs_spray", over, false, over, true),
       airbrush: make("fs_airbrush", over, false, over, true),
       smudge: make("fs_pen", replace, false),

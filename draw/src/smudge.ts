@@ -7,6 +7,11 @@ export function base64(bytes: Uint8Array | Uint8ClampedArray) {
   return btoa(binary);
 }
 
+export function unpackPixels(data: string): Uint8Array<ArrayBuffer> {
+  const text = atob(data);
+  return Uint8Array.from(text, (c) => c.charCodeAt(0));
+}
+
 export function smudgedPixels(stroke: Stroke) {
   const patch = stroke.patch;
   if (!patch) return null;

@@ -573,7 +573,6 @@ onBeforeUnmount(() => {
     :class="{ dark: playFrame?.ui.dark ?? dark }"
     :data-player="inPlayer"
     :data-recording="recordState"
-    :data-elapsed="session.elapsed.value"
     @dragover.prevent
     @drop="session.drop"
     :data-ready="ready && drawable ? 'true' : 'false'"
@@ -782,7 +781,7 @@ onBeforeUnmount(() => {
           @toggle="book.toggleLayer"
           @add="book.addLayer"
           @duplicate="book.duplicateLayer"
-          @merge="book.mergeDown"
+          @merge="surface.mergeDown"
           @remove="book.deleteLayer"
           @move="book.moveLayer"
           @rename="book.renameLayer"
