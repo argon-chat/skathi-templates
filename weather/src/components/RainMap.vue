@@ -190,7 +190,8 @@ const open = (url: string) => window.open(url);
   flex: 1;
   min-height: 0;
   overflow: hidden;
-  border-radius: 23px 23px 0 0;
+  border-radius: 29px 29px 0 0;
+  corner-shape: squircle;
 }
 .base,
 .rain {

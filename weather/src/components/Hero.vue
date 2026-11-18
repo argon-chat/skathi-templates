@@ -77,6 +77,7 @@ function search() {
   gap: 16px;
   padding: 0 0 0 20px;
   z-index: 3;
+  text-shadow: 0 1px 12px #140a3380;
 }
 .where {
   position: relative;
@@ -125,6 +126,7 @@ function search() {
   position: absolute;
   top: 48px;
   left: 18px;
+  text-shadow: none;
   width: 280px;
   display: flex;
   flex-direction: column;

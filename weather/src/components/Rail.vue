@@ -50,7 +50,8 @@ const items: { view: View; icon: IconName; title: string }[] = [
   display: flex;
   align-items: center;
   justify-content: center;
-  border-radius: 16px;
+  border-radius: 18px;
+  corner-shape: squircle;
   border: 1px solid transparent;
   background: transparent;
   color: #ffffffb3;

@@ -15,7 +15,7 @@ const hours = computed(() => {
     0,
     f.hours.findIndex((h) => h.time + 3600 > now),
   );
-  return f.hours.slice(from, from + 8).map((h, i) => ({
+  return f.hours.slice(from, from + 24).map((h, i) => ({
     key: h.time,
     label: i === 0 ? "Now" : hourOf(h.time, f.offset),
     code: i === 0 && app.preview ? PREVIEW_CODES[app.preview] : h.code,
@@ -27,28 +27,41 @@ const hours = computed(() => {
 
 <template>
   <Glass class="hourly">
-    <div v-for="(h, i) in hours" :key="h.key" class="hour" :class="{ now: i === 0 }">
-      <span class="label">{{ h.label }}</span>
-      <WeatherIcon :code="h.code" :night="!h.day" :size="38" />
-      <span class="temp">{{ h.temp }}</span>
+    <div class="strip">
+      <div v-for="(h, i) in hours" :key="h.key" class="hour" :class="{ now: i === 0 }">
+        <span class="label">{{ h.label }}</span>
+        <WeatherIcon :code="h.code" :night="!h.day" :size="38" />
+        <span class="temp">{{ h.temp }}</span>
+      </div>
     </div>
   </Glass>
 </template>
 
 <style scoped>
 .hourly {
+  padding: 12px 0;
+}
+.strip {
   display: flex;
-  justify-content: space-between;
-  padding: 12px 14px;
+  gap: 34px;
+  padding: 0 14px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-snap-type: x mandatory;
+  scroll-padding-inline: 14px;
+  mask-image: linear-gradient(270deg, transparent, #000 40px);
 }
 .hour {
   width: 62px;
+  flex-shrink: 0;
+  scroll-snap-align: start;
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 6px;
   padding: 10px 0 12px;
-  border-radius: 16px;
+  border-radius: 18px;
+  corner-shape: squircle;
 }
 .hour.now {
   border: 1px solid #ffffff26;
@@ -68,7 +81,7 @@ const hours = computed(() => {
 }
 @media (max-height: 880px) {
   .hourly {
-    padding: 8px 14px;
+    padding: 8px 0;
   }
   .hour {
     padding: 8px 0 10px;

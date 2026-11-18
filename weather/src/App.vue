@@ -113,5 +113,6 @@ onUnmounted(() => stop());
   margin: 0;
   font-size: 34px;
   font-weight: 300;
+  text-shadow: 0 1px 12px #140a3380;
 }
 </style>
