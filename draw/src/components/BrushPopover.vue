@@ -32,6 +32,17 @@ const particles = computed(() => {
   for (let i = 0; i < points.length; i += STRIDE) add(i, (d) => dots.push(d));
   return dots;
 });
+// Three pigment bands dragged across the original straight edge of a painted swatch.
+const smear = computed(() => {
+  const reach = props.settings.opacity * 78;
+  const radius = 3 + Math.min(20, props.settings.size * 0.22);
+  return [0.4, 0.75, 1].map((weight, i) => {
+    const y = 27 + i * 4,
+      r = radius * weight,
+      x = 97 + reach * weight;
+    return `M49 10H97V${y - r}C97 ${y - r / 3} ${x - 9} ${y - 7} ${x} ${y - 3}C${x - 10} ${y + 2} 97 ${y + 2} 97 ${y + r}V54H49Z`;
+  });
+});
 const sizeText = (v: number) => (v < 10 ? v.toFixed(1) : String(Math.round(v)));
 const percent = (v: number) => `${Math.round(v * 100)}%`;
 </script>
@@ -59,12 +70,25 @@ const percent = (v: number) => `${Math.round(v * 100)}%`;
           :opacity="d.opacity * settings.opacity"
         />
       </g>
+      <g v-else-if="tool === 'smudge'">
+        <path d="M49 10H199V54H49Z" fill="#e6b777" />
+        <path v-for="(path, i) in smear" :key="i" :d="path" fill="#496c82" :opacity="[0.85, 0.48, 0.36][i]" />
+      </g>
+      <g v-else-if="tool === 'bucket'" stroke="#82868b" stroke-width="2" stroke-linejoin="round">
+        <path d="M48 46Q36 22 66 15Q87 8 109 18L136 12Q166 6 190 26Q204 44 178 50L142 48Q112 58 91 48Z" fill="none" />
+        <path
+          d="M48 46Q36 22 66 15Q87 8 109 18Q95 33 110 50Q101 52 91 48Z M66 28a6 6 0 1 0 12 0a6 6 0 1 0 -12 0Z"
+          fill-rule="evenodd"
+          :fill="color"
+          :fill-opacity="alpha"
+        />
+      </g>
       <path
-        v-else-if="tool === 'bucket' || tool === 'lasso-fill'"
+        v-else-if="tool === 'lasso-fill'"
         d="M34 38Q38 15 84 21T155 23Q218 9 211 31T144 40Q51 59 34 38Z"
         :fill="color"
         :fill-opacity="alpha"
-        :stroke="tool === 'bucket' ? color : 'none'"
+        stroke="none"
       />
       <path
         v-else
@@ -92,7 +116,7 @@ const percent = (v: number) => `${Math.round(v * 100)}%`;
       />
       <Slider
         id="brush-opacity"
-        label="Opacity"
+        :label="tool === 'smudge' ? 'Strength' : 'Opacity'"
         :value="settings.opacity"
         :min="0.05"
         :max="1"

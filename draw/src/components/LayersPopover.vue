@@ -2,6 +2,7 @@
 import { computed, ref } from "vue";
 import { BLEND_MODES, type BlendMode, type Layer } from "../model";
 import { hideTip, showTip } from "../tooltip";
+import { rasterMerge } from "../merge";
 import Icon from "./Icon.vue";
 import Slider from "./Slider.vue";
 
@@ -24,6 +25,18 @@ const emit = defineEmits<{
 const rows = computed(() => props.layers.map((layer, index) => ({ layer, index })).reverse());
 const current = computed(() => props.layers.find((l) => l.id === props.active));
 const activeIndex = computed(() => props.layers.findIndex((l) => l.id === props.active));
+const mergePixels = computed(() => {
+  const upper = current.value,
+    lower = props.layers[activeIndex.value - 1];
+  return !!lower && !!upper && rasterMerge(lower, upper);
+});
+const mergeHidden = computed(() => {
+  const lower = props.layers[activeIndex.value - 1];
+  return !!lower && (!lower.visible || !current.value?.visible);
+});
+const mergeHint = computed(() =>
+  mergePixels.value ? "Merge down as pixels to preserve the layer effects" : "Merge down",
+);
 const editing = ref<string | null>(null);
 const draft = ref("");
 const drag = ref<{ id: string; from: number; dy: number; pointer: number; start: number } | null>(null);
@@ -93,6 +106,8 @@ function nudge(e: KeyboardEvent, layer: Layer, index: number) {
 
 <template>
   <div class="popover pill layers" role="dialog" aria-label="Layers">
+    <small v-if="mergePixels" class="merge-note">Merge down rasterizes these layer effects.</small>
+    <small v-else-if="mergeHidden" class="merge-note">Merge down keeps the hidden strokes as vectors.</small>
     <ul class="list" role="listbox" aria-label="Layers" :style="{ height: `${rows.length * ROW - 2}px` }">
       <li
         v-for="({ layer, index }, visual) in rows"
@@ -207,10 +222,10 @@ function nudge(e: KeyboardEvent, layer: Layer, index: number) {
         <button
           id="merge-layer"
           class="icon-button small"
-          aria-label="Merge down"
+          :aria-label="mergeHint"
           :disabled="activeIndex < 1"
           @click="emit('merge', active)"
-          @pointerenter="showTip($event, 'Merge down', true)"
+          @pointerenter="showTip($event, mergeHint, true)"
           @pointerleave="hideTip"
         >
           <Icon name="merge" :size="16" />
@@ -235,6 +250,10 @@ function nudge(e: KeyboardEvent, layer: Layer, index: number) {
 .layers {
   width: 280px;
   padding: 6px;
+}
+.merge-note {
+  display: block;
+  padding: 6px 8px;
 }
 .list {
   position: relative;

@@ -36,6 +36,8 @@ import {
   type Tool,
   type ToolSettings,
 } from "./model";
+import { canonicalPoint, coordinate16, fraction16 } from "./precision";
+import { rasterMerge } from "./merge";
 import { Marks, type Rgba } from "./overlay";
 import { meshOf, Renderer, type View } from "./renderer";
 import type { DrawAtomic, DrawRecording, DrawMutation } from "./events";
@@ -73,7 +75,16 @@ interface Options {
 type Handle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "rotate" | "move";
 
 type Gesture =
-  | { kind: "draw"; id: number; lives: LiveStroke[]; transforms: Affine[]; stab: Stabilizer; sx: number; sy: number }
+  | {
+      kind: "draw";
+      id: number;
+      lives: LiveStroke[];
+      transforms: Affine[];
+      stab: Stabilizer;
+      started: number;
+      sx: number;
+      sy: number;
+    }
   | { kind: "shape"; id: number; start: Point; lives: LiveShape[]; transforms: Affine[] }
   | { kind: "pan"; id: number; x: number; y: number }
   | { kind: "pinch"; distance: number; angle: number; zoom: number; viewAngle: number; docX: number; docY: number }
@@ -149,7 +160,7 @@ export function useSurface(o: Options) {
   let size = { w: 0, h: 0 };
   let gesture: Gesture | null = null;
   let playback = false;
-  let processing = false;
+  const processing = book.documentBusy;
   let onCancelDraft: (() => void) | undefined;
   let inputsEnabled = true;
   let holdTimer: ReturnType<typeof setInterval> | undefined;
@@ -280,25 +291,17 @@ export function useSurface(o: Options) {
       color: tool === "eraser" ? "ink" : color.value,
       width: s.size,
       points: [],
-      ...(s.opacity < 1 && { opacity: s.opacity }),
+      ...(s.opacity < 1 && { opacity: fraction16(s.opacity) }),
       ...(layer.alphaLocked && { alphaLocked: true }),
       ...((tool === "spray" || tool === "pencil" || tool === "airbrush") && { seed: Math.imul(seq, 2654435761) >>> 0 }),
-      ...(s.scatter !== undefined && { scatter: s.scatter }),
-      ...(s.density !== undefined && { density: s.density }),
-      ...(s.hardness !== undefined && { hardness: s.hardness }),
+      ...(s.scatter !== undefined && { scatter: fraction16(s.scatter) }),
+      ...(s.density !== undefined && { density: fraction16(s.density) }),
+      ...(s.hardness !== undefined && { hardness: fraction16(s.hardness) }),
     };
   }
   function addPoint(live: LiveStroke, x: number, y: number, p: number, tx: number, ty: number, tw: number, t: number) {
     const pts = live.stroke.points;
-    live.add(
-      Math.round(x * 16) / 16,
-      Math.round(y * 16) / 16,
-      Math.round(p * 65535) / 65535,
-      Math.round(tx),
-      Math.round(ty),
-      Math.round(tw),
-      Math.max(pts.at(-1) ?? 0, Math.round(t)),
-    );
+    live.add(...canonicalPoint(x, y, p, tx, ty, tw, Math.max(pts.at(-1) ?? 0, t)));
   }
   function startDeposition() {
     const start = performance.now();
@@ -331,6 +334,7 @@ export function useSurface(o: Options) {
       lives,
       transforms,
       stab: new Stabilizer(s.streamline),
+      started: e.timeStamp,
       sx: e.clientX,
       sy: e.clientY,
     };
@@ -353,7 +357,7 @@ export function useSurface(o: Options) {
     const d = toDoc(at.x, at.y);
     for (const [i, live] of g.lives.entries()) {
       const q = apply(g.transforms[i]!, d.x, d.y);
-      addPoint(live, q.x, q.y, p, e.tiltX, e.tiltY, e.twist, t);
+      addPoint(live, q.x, q.y, p, e.tiltX, e.tiltY, e.twist, t - g.started);
     }
   }
 
@@ -361,7 +365,7 @@ export function useSurface(o: Options) {
     if (gesture?.kind !== "draw") return;
     clearInterval(holdTimer);
     if (!e) onCancelDraft?.();
-    const { lives, transforms, stab } = gesture;
+    const { lives, transforms, stab, started } = gesture;
     gesture = null;
     drawing.value = false;
     if (temporary.value === "eraser") temporary.value = null;
@@ -372,7 +376,7 @@ export function useSurface(o: Options) {
         const n = pts.length;
         const q = apply(transforms[i]!, d.x, d.y);
         if (!stab.trailing && Math.hypot(q.x - pts[n - 7]!, q.y - pts[n - 6]!) * view.zoom > 0.3)
-          addPoint(live, q.x, q.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp);
+          addPoint(live, q.x, q.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp - started);
       }
       const strokes = lives
         .map((l) => l.stroke)
@@ -388,45 +392,37 @@ export function useSurface(o: Options) {
   }
 
   async function resolvePaint(layer: Layer, run: () => Promise<Stroke[]>) {
-    processing = true;
+    processing.value = true;
     try {
       const result = await run();
-      if (!playback && activeLayer() === layer && result.length) book.addStrokes(result);
+      processing.value = false;
+      if (result.length) book.addStrokes(result, layer.id);
     } catch (e) {
       o.notify(e instanceof Error ? e.message : "Could not sample this layer");
     } finally {
-      processing = false;
+      processing.value = false;
     }
   }
 
   async function mergeDown(id: string) {
-    if (processing || playback || drawing.value) return;
+    if (processing.value || playback || drawing.value) return;
     const i = book.layers.value.findIndex((l) => l.id === id);
     const upper = book.layers.value[i],
       lower = book.layers.value[i - 1];
     if (!upper || !lower || !renderer) return;
-    const isolated =
-      !!upper.clipping ||
-      (upper.blendMode ?? "normal") !== "normal" ||
-      (lower.blendMode ?? "normal") !== "normal" ||
-      lower.opacity !== 1 ||
-      upper.opacity !== 1 ||
-      !lower.visible ||
-      !upper.visible ||
-      upper.strokes.some((s) => s.tool === "eraser" || s.alphaLocked || !!s.patch);
-    if (!isolated) {
+    if (!rasterMerge(lower, upper)) {
       book.mergeDown(id);
       return;
     }
-    processing = true;
+    processing.value = true;
     try {
       const merged = await renderer.mergeLayers(lower, upper, book.nextSeq());
-      const current = book.layers.value.findIndex((l) => l === upper);
-      if (!playback && current > 0 && book.layers.value[current - 1] === lower) book.mergeDown(id, merged);
+      processing.value = false;
+      book.mergeDown(id, merged);
     } catch (e) {
       o.notify(e instanceof Error ? e.message : "Could not merge these layers.");
     } finally {
-      processing = false;
+      processing.value = false;
     }
   }
 
@@ -447,8 +443,8 @@ export function useSurface(o: Options) {
         o.notify("This area is open. Close its outline to fill it.");
         return [];
       }
-      stroke.points = [point.x, point.y, 1, 0, 0, 0, 0];
-      stroke.contours = contours;
+      stroke.points = canonicalPoint(point.x, point.y, 1, 0, 0, 0, 0);
+      stroke.contours = contours.map((ring) => ring.map(coordinate16));
       return [stroke];
     });
   }
@@ -480,7 +476,7 @@ export function useSurface(o: Options) {
       const points: number[] = [];
       for (const [k, p] of doc.entries()) {
         const q = apply(g.transforms[i]!, p.x, p.y);
-        points.push(Math.round(q.x * 16) / 16, Math.round(q.y * 16) / 16, SHAPE_PRESSURE, 0, 0, 0, k);
+        points.push(...canonicalPoint(q.x, q.y, SHAPE_PRESSURE, 0, 0, 0, k));
       }
       live.set(points);
     }
@@ -559,7 +555,7 @@ export function useSurface(o: Options) {
   }
 
   function down(e: PointerEvent) {
-    if (!inputsEnabled || playback || processing || !book.ready.value) return;
+    if (!inputsEnabled || playback || processing.value || !book.ready.value) return;
     if (e.pointerType === "pen") {
       lastPen = performance.now();
       penInRange = true;
@@ -1077,6 +1073,9 @@ export function useSurface(o: Options) {
   onMounted(async () => {
     const el = canvas.value;
     if (!el) return;
+    // Recovery may restore the camera while the GPU adapter is still opening.
+    fit();
+    addEventListener("resize", fit);
     try {
       renderer = await Renderer.create(el);
     } catch (e) {
@@ -1084,11 +1083,10 @@ export function useSurface(o: Options) {
       return;
     }
     renderer.overlay = buildOverlay;
-    size = { w: 0, h: 0 };
     fit();
+    renderer.setView(view);
     theme();
     renderer.setLayers(book.layers.value);
-    addEventListener("resize", fit);
     ready.value = true;
   });
 
@@ -1138,7 +1136,7 @@ export function useSurface(o: Options) {
       theme();
     },
     mergeDown,
-    painting: () => drawing.value || processing,
+    painting: () => drawing.value || processing.value,
     enableInput(value: boolean) {
       inputsEnabled = value;
     },
@@ -1152,8 +1150,11 @@ export function useSurface(o: Options) {
       if (!g || (g.kind !== "draw" && g.kind !== "shape") || !layer || !gpu) return null;
       let strokes = g.lives.map((l) => l.stroke).filter((s) => s.points.length);
       if (strokes.some((s) => s.tool === "smudge"))
-        strokes = await Promise.all(strokes.map((s) => gpu.smudge({ ...s, points: s.points.slice() }, layer.id)));
+        strokes = await Promise.all(strokes.map((s) => gpu.smudge(s, layer.id, true)));
       return g === gesture && strokes.length ? { kind: "stroke", layer: layer.id, strokes } : null;
+    },
+    async rastersReady() {
+      await renderer?.rastersReady();
     },
     async preparePlayback(file: DrawRecording, isCurrent: () => boolean) {
       function* members(m: DrawAtomic) {
@@ -1171,8 +1172,14 @@ export function useSurface(o: Options) {
         }
       }
       let since = performance.now();
+      // Warm small recordings for scrubbing. Larger recordings build meshes on demand.
+      let remaining = 168 * 1024 * 1024;
+      const visited = new WeakSet<Stroke>();
       for (const stroke of geometry()) {
-        meshOf(stroke);
+        if (visited.has(stroke) || stroke.patch) continue;
+        visited.add(stroke);
+        if (remaining <= 0 || stroke.points.length > STRIDE * 4096) break;
+        remaining -= meshOf(stroke).bytes.byteLength;
         if (performance.now() - since > 8) {
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
           if (!isCurrent()) return;

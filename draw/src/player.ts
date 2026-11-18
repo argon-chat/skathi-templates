@@ -23,6 +23,7 @@ export interface DrawPlaybackApi {
 
 interface Output {
   prepare?(file: DrawRecording, current: () => boolean): Promise<void>;
+  settled?(): Promise<void>;
   enter?(): void;
   present(frame: PlayerFrame): void;
   close(continueDrawing: boolean, frame: PlayerFrame): void;
@@ -51,10 +52,16 @@ export function createPlayer(output: Output) {
   let opening = 0;
   let pending: { promise: Promise<void>; resolve: () => void; reject: (e: unknown) => void } | undefined;
 
-  function pause() {
+  function stopClock() {
     if (raf) cancelAnimationFrame(raf);
     raf = 0;
     playing.value = false;
+  }
+
+  function pause() {
+    stopClock();
+    pending?.resolve();
+    pending = undefined;
   }
 
   function display(ms: number, event?: number) {
@@ -67,7 +74,7 @@ export function createPlayer(output: Output) {
   }
 
   function abandon() {
-    pause();
+    stopClock();
     pending?.reject(new DOMException("Playback closed before the end.", "AbortError"));
     pending = undefined;
   }
@@ -95,14 +102,20 @@ export function createPlayer(output: Output) {
     density.value = next.density;
     display(0);
     await nextTick();
+    await output.settled?.();
     return { duration: file.duration, events: file.events.length };
   }
 
   function finish() {
-    pause();
+    stopClock();
     const ended = pending;
     pending = undefined;
-    void nextTick().then(() => ended?.resolve());
+    void nextTick()
+      .then(() => output.settled?.())
+      .then(
+        () => ended?.resolve(),
+        (e) => ended?.reject(e),
+      );
   }
 
   async function seek(ms: number) {
@@ -112,6 +125,7 @@ export function createPlayer(output: Output) {
     display(ms);
     if (position.value === duration.value) finish();
     await nextTick();
+    await output.settled?.();
   }
 
   function step() {
@@ -142,7 +156,7 @@ export function createPlayer(output: Output) {
   async function play(options: PlayOptions = {}) {
     if (!timeline) throw new Error("Open a drawing recording first.");
     configure(options);
-    pause();
+    stopClock();
     if (position.value >= duration.value || options.fitTo !== undefined) display(0);
     else display(position.value);
     if (!pending) {
@@ -180,7 +194,7 @@ export function createPlayer(output: Output) {
           raf = requestAnimationFrame(tick);
         }
       } catch (e) {
-        pause();
+        stopClock();
         pending?.reject(e);
         pending = undefined;
       }

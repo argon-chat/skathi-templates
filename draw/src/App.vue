@@ -75,7 +75,7 @@ const busy = ref(false);
 const placement = shallowRef<Record<string, string>>({});
 const tipParts = computed(() => tip.value?.text.split("  ") ?? []);
 const book = useSketchbook();
-const { layers, active, ready, canUndo, canRedo, strokeCount } = book;
+const { layers, active, ready, canUndo, canRedo, strokeCount, documentBusy } = book;
 const surface = useSurface({
   canvas,
   book,
@@ -103,6 +103,7 @@ const session = useRecordingSession({
   notify,
   ui: computed<DrawUi>(() => ({
     mode: mode.value,
+    shape: shape.value,
     color: color.value,
     size: settings[brushTool.value].size,
     active: active.value,
@@ -118,6 +119,7 @@ const session = useRecordingSession({
   restore(frame) {
     const s = frame.ui;
     if (s.mode) setMode(s.mode);
+    if (s.shape) shape.value = s.shape;
     if (s.color) chooseColor(s.color);
     if (s.size && isTool(mode.value)) settings[mode.value].size = s.size;
     if (s.paper) paper.value = s.paper;
@@ -573,6 +575,7 @@ onBeforeUnmount(() => {
     :class="{ dark: playFrame?.ui.dark ?? dark }"
     :data-player="inPlayer"
     :data-recording="recordState"
+    :aria-busy="documentBusy"
     @dragover.prevent
     @drop="session.drop"
     :data-ready="ready && drawable ? 'true' : 'false'"
@@ -621,7 +624,7 @@ onBeforeUnmount(() => {
             id="undo"
             class="icon-button"
             aria-label="Undo"
-            :disabled="!canUndo"
+            :disabled="!canUndo || documentBusy"
             @click="book.undo"
             @pointerenter="showTip($event, 'Undo  Ctrl+Z', true)"
             @focus="showTip($event, 'Undo  Ctrl+Z', true)"
@@ -634,7 +637,7 @@ onBeforeUnmount(() => {
             id="redo"
             class="icon-button"
             aria-label="Redo"
-            :disabled="!canRedo"
+            :disabled="!canRedo || documentBusy"
             @click="book.redo"
             @pointerenter="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
             @focus="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
@@ -703,15 +706,17 @@ onBeforeUnmount(() => {
               id="recording"
               class="record-button"
               :class="{ active: session.active.value }"
-              aria-label="Recording"
+              :aria-label="recordState === 'error' ? 'Recording interrupted' : 'Recording'"
               :disabled="!session.ready.value || !ready"
               @click="toggle('recording', $event)"
               @pointerenter="showTip($event, 'Recording', true)"
               @pointerleave="hideTip"
             >
-              <i class="record-dot" :class="{ paused: recordState === 'paused' }" /><span v-if="session.active.value">{{
-                stamp
-              }}</span>
+              <span v-if="recordState === 'error'" role="status">Recording interrupted</span>
+              <i v-else class="record-dot" :class="{ paused: recordState === 'paused' }" /><span
+                v-if="session.active.value && recordState !== 'error'"
+                >{{ stamp }}</span
+              >
             </button>
           </div>
           <div class="cluster pill anchor">
@@ -731,6 +736,7 @@ onBeforeUnmount(() => {
             </button>
             <button
               id="layers"
+              :disabled="documentBusy"
               class="icon-button"
               :class="{ on: open === 'layers' }"
               aria-label="Layers"
@@ -807,10 +813,10 @@ onBeforeUnmount(() => {
       </Transition>
       <Transition name="pop">
         <div v-if="open === 'menu'" class="popover pill menu" :style="placement" role="menu" aria-label="More">
-          <button id="new-drawing" class="item" role="menuitem" @click="newDrawing">
+          <button id="new-drawing" :disabled="documentBusy" class="item" role="menuitem" @click="newDrawing">
             <Icon name="page" :size="16" />New drawing
           </button>
-          <button id="load-sample" class="item" role="menuitem" @click="loadSample">
+          <button id="load-sample" :disabled="documentBusy" class="item" role="menuitem" @click="loadSample">
             <Icon name="flower" :size="16" />Load sample
           </button>
           <i class="rule" />
@@ -949,7 +955,13 @@ onBeforeUnmount(() => {
         aria-label="Recording"
       >
         <p class="heading">Recording</p>
-        <template v-if="!session.active.value">
+        <template v-if="recordState === 'error'">
+          <small role="alert">{{ session.error.value }}</small>
+          <button id="record-retry" class="item" :disabled="session.busy.value" @click="session.retry">
+            Retry recording
+          </button>
+        </template>
+        <template v-else-if="!session.active.value">
           <input
             v-model="recordTitle"
             aria-label="Recording title"
@@ -1066,7 +1078,9 @@ onBeforeUnmount(() => {
       </div>
       <PlayerTransport v-if="!cleanPlayer" :player="player" />
     </template>
-    <p v-if="notice" class="notice pill" role="status">{{ notice }}</p>
+    <p v-if="documentBusy || notice" class="notice pill" role="status">
+      {{ documentBusy ? "Applying changes…" : notice }}
+    </p>
 
     <ShortcutsSheet v-if="sheet" @close="sheet = false" />
 
