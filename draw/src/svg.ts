@@ -1,5 +1,7 @@
 import { dabStream, strokeRings } from "./pigments";
-import { pngData, smudgedPixels, unpackPixels } from "./smudge";
+import { pngUrl, encodePng, loadRaster } from "./smudge";
+import { paintGroups, type PaintGroup } from "./paintGroups";
+import { INK } from "./model";
 import { STRIDE } from "./model";
 import type { Bounds } from "./geometry";
 import { trace } from "./ink";
@@ -101,91 +103,96 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
   };
   for (const layer of layers) {
     if (!layer.visible || !layer.strokes.length) {
-      below = null;
+      if (!layer.clipping) below = null;
       continue;
     }
-    let content = "";
-    for (const stroke of layer.strokes) {
-      if (stroke.tool === "eraser" && stroke.alphaLocked) continue;
-      const fill = stroke.color === "ink" ? o.ink : stroke.color;
-      let mark = "";
-      if (stroke.tool === "smudge") {
-        const result = smudgedPixels(stroke),
-          patch = stroke.patch;
-        if (!result || !patch) continue;
-        const cut = new Uint8ClampedArray(result.pixels.length);
-        for (let i = 0; i < result.mask.length; i++) {
-          if (result.mask[i]) cut[i * 4 + 3] = 255;
-          else result.pixels[i * 4 + 3] = 0;
-        }
-        const attrs = `x="${patch.x}" y="${patch.y}" width="${patch.width}" height="${patch.height}"${patch.transform ? ` transform="matrix(${patch.transform.join(" ")})"` : ""}`;
-        const id = mask(
-          `<rect ${area} fill="#fff"/><image ${attrs} href="${await pngData(cut, result.w, result.h)}"/>`,
-        );
-        content = `<g mask="url(#${id})">${content}</g><image ${attrs} href="${await pngData(result.pixels, result.w, result.h)}"/>`;
-        continue;
-      }
-      if (stroke.tool === "bucket" && stroke.patch) {
-        const p = stroke.patch;
-        const attrs = `x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}"${p.transform ? ` transform="matrix(${p.transform.join(" ")})"` : ""}`;
-        const rgba = new Uint8ClampedArray(unpackPixels(p.rgba).buffer);
-        mark = `<image ${attrs} opacity="${n(stroke.opacity ?? 1)}" href="${await pngData(rgba, p.width, p.height)}"/>`;
-      } else if (stroke.tool === "spray" || stroke.tool === "airbrush") {
-        const add = dabStream(stroke);
-        let paint = fill;
-        if (stroke.tool === "airbrush") {
-          const id = `air-${++masks}`,
-            h = stroke.hardness ?? 0.25;
-          const stops = [0, 0.25, 0.5, 0.75, 1]
-            .map(
-              (t) =>
-                `<stop offset="${h + (1 - h) * t}" stop-color="${fill}" stop-opacity="${(Math.exp(-4 * t * t) - Math.exp(-4)) / (1 - Math.exp(-4))}"/>`,
-            )
-            .join("");
-          defs.push(`<radialGradient id="${id}">${stops}</radialGradient>`);
-          paint = `url(#${id})`;
-        }
-        const dots: string[] = [];
-        for (let i = 0; i < stroke.points.length; i += STRIDE)
-          add(i, (d) =>
-            dots.push(
-              `<circle cx="${n(d.x)}" cy="${n(d.y)}" r="${n(d.radius)}" opacity="${n(d.opacity * (stroke.opacity ?? 1))}"/>`,
-            ),
-          );
-        mark = `<g fill="${paint}">${dots.join("")}</g>`;
-      } else {
-        const d =
-          stroke.tool === "lasso-fill" || stroke.tool === "bucket"
-            ? strokeRings(stroke)
-                .filter((r) => r.length >= 6)
-                .map((r) => {
-                  const points: string[] = [];
-                  for (let i = 0; i < r.length; i += 2) points.push(`${n(r[i]!)} ${n(r[i + 1]!)}`);
-                  return "M" + points.join("L") + "Z";
-                })
-                .join("")
-            : outline(stroke);
-        if (!d) continue;
-        if (stroke.tool === "eraser") {
-          const id = mask(`<rect ${area} fill="#fff"/><path d="${d}" fill="#000" fill-opacity="${alpha(stroke)}"/>`);
-          content = `<g mask="url(#${id})">${content}</g>`;
+    async function paint(items: readonly (Stroke | PaintGroup<Stroke>)[]) {
+      let content = "";
+      for (const stroke of items) {
+        if ("children" in stroke) {
+          content += "<g>" + (await paint(stroke.children)) + "</g>";
           continue;
         }
-        mark = `<path d="${d}" fill="${fill}" fill-rule="evenodd"${alpha(stroke) < 1 ? ` fill-opacity="${n(alpha(stroke))}"` : ""}/>`;
-      }
-      if (stroke.alphaLocked) {
-        const base = `prior-${++masks}`;
-        defs.push(`<g id="${base}">${content}</g>`);
-        const id = mask(`<use href="#${base}"/>`, true);
-        if (!opaqueFilter) {
-          defs.push(
-            `<filter id="opaque-ink" filterUnits="userSpaceOnUse" ${area} color-interpolation-filters="sRGB"><feComponentTransfer><feFuncA type="linear" slope="0" intercept="1"/></feComponentTransfer></filter>`,
-          );
-          opaqueFilter = true;
+        if (stroke.tool === "eraser" && stroke.alphaLocked) continue;
+        const fill = stroke.color === "ink" ? o.ink : stroke.color;
+        let mark = "";
+        if (stroke.patch) {
+          const p = stroke.patch,
+            night = o.ink.toLowerCase() === INK.dark.toLowerCase();
+          const img = pngUrl(night && p.darkPng ? p.darkPng : p.png);
+          const attrs = `x="${p.x}" y="${p.y}" width="${p.width}" height="${p.height}"${p.transform ? ` transform="matrix(${p.transform.join(" ")})"` : ""}`;
+          if (stroke.tool === "smudge" && p.coveragePng) {
+            const result = await loadRaster(p);
+            const cut = new Uint8ClampedArray(p.width * p.height * 4);
+            if (result.coverage)
+              for (let i = 0; i < result.coverage.length; i++) if (result.coverage[i]! & 0xffffff) cut[i * 4 + 3] = 255;
+            const id = mask(
+              `<rect ${area} fill="#fff"/><image ${attrs} href="${pngUrl(await encodePng(cut, p.width, p.height))}"/>`,
+            );
+            content = `<g mask="url(#${id})">${content}</g><image ${attrs} href="${img}"/>`;
+            continue;
+          }
+          mark = `<image ${attrs} opacity="${n(stroke.opacity ?? 1)}" href="${img}"/>`;
+        } else if (stroke.tool === "smudge") continue;
+        else if (stroke.tool === "spray" || stroke.tool === "airbrush") {
+          const add = dabStream(stroke);
+          let paint = fill;
+          if (stroke.tool === "airbrush") {
+            const id = `air-${++masks}`,
+              h = stroke.hardness ?? 0.25;
+            const stops = [0, 0.25, 0.5, 0.75, 1]
+              .map(
+                (t) =>
+                  `<stop offset="${h + (1 - h) * t}" stop-color="${fill}" stop-opacity="${(Math.exp(-4 * t * t) - Math.exp(-4)) / (1 - Math.exp(-4))}"/>`,
+              )
+              .join("");
+            defs.push(`<radialGradient id="${id}">${stops}</radialGradient>`);
+            paint = `url(#${id})`;
+          }
+          const dots: string[] = [];
+          for (let i = 0; i < stroke.points.length; i += STRIDE)
+            add(i, (d) =>
+              dots.push(
+                `<circle cx="${n(d.x)}" cy="${n(d.y)}" r="${n(d.radius)}" opacity="${n(d.opacity * (stroke.opacity ?? 1))}"/>`,
+              ),
+            );
+          mark = `<g fill="${paint}">${dots.join("")}</g>`;
+        } else {
+          const d =
+            stroke.tool === "lasso-fill" || stroke.tool === "bucket"
+              ? strokeRings(stroke)
+                  .filter((r) => r.length >= 6)
+                  .map((r) => {
+                    const points: string[] = [];
+                    for (let i = 0; i < r.length; i += 2) points.push(`${n(r[i]!)} ${n(r[i + 1]!)}`);
+                    return "M" + points.join("L") + "Z";
+                  })
+                  .join("")
+              : outline(stroke);
+          if (!d) continue;
+          if (stroke.tool === "eraser") {
+            const id = mask(`<rect ${area} fill="#fff"/><path d="${d}" fill="#000" fill-opacity="${alpha(stroke)}"/>`);
+            content = `<g mask="url(#${id})">${content}</g>`;
+            continue;
+          }
+          mark = `<path d="${d}" fill="${fill}" fill-rule="evenodd"${alpha(stroke) < 1 ? ` fill-opacity="${n(alpha(stroke))}"` : ""}/>`;
         }
-        content = `<g mask="url(#${id})"><use href="#${base}" filter="url(#opaque-ink)"/>${mark}</g>`;
-      } else content += mark;
+        if (stroke.alphaLocked) {
+          const base = `prior-${++masks}`;
+          defs.push(`<g id="${base}">${content}</g>`);
+          const id = mask(`<use href="#${base}"/>`, true);
+          if (!opaqueFilter) {
+            defs.push(
+              `<filter id="opaque-ink" filterUnits="userSpaceOnUse" ${area} color-interpolation-filters="sRGB"><feComponentTransfer><feFuncA type="linear" slope="0" intercept="1"/></feComponentTransfer></filter>`,
+            );
+            opaqueFilter = true;
+          }
+          content = `<g mask="url(#${id})"><use href="#${base}" filter="url(#opaque-ink)"/>${mark}</g>`;
+        } else content += mark;
+      }
+      return content;
     }
+    let content = await paint(paintGroups(layer.strokes));
     if (layer.clipping) {
       if (!below) {
         below = null;
@@ -200,7 +207,7 @@ export async function toSvg(layers: readonly Layer[], o: SvgOptions): Promise<st
     const style = blend && blend !== "normal" ? ` style="mix-blend-mode:${blend}"` : "";
     defs.push(`<g id="${id}"${opacity}>${content}</g>`);
     body.push(`<use data-layer-id="${escape(layer.id)}" data-name="${escape(layer.name)}" href="#${id}"${style}/>`);
-    below = id;
+    if (!layer.clipping) below = id;
   }
   return (
     `<svg xmlns="http://www.w3.org/2000/svg" viewBox="${n(minX)} ${n(minY)} ${n(w)} ${n(h)}" width="${Math.ceil(w)}" height="${Math.ceil(h)}">` +

@@ -24,7 +24,9 @@ export interface RasterPatch {
   y: number;
   width: number;
   height: number;
-  rgba: string;
+  png: Uint8Array;
+  darkPng?: Uint8Array;
+  coveragePng?: Uint8Array;
   transform?: [number, number, number, number, number, number];
 }
 export type Tool = (typeof TOOLS)[number];
@@ -64,6 +66,7 @@ export interface Stroke {
   hardness?: number;
   scatter?: number;
   alphaLocked?: boolean;
+  scope?: number[];
   contours?: number[][];
   patch?: RasterPatch;
 }

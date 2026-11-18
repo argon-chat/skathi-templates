@@ -8,6 +8,30 @@ export interface Dab {
   opacity: number;
 }
 
+function deposition(stroke: Stroke, i: number, distance: number) {
+  const p = stroke.points,
+    prev = Math.max(0, i - STRIDE);
+  const ms = i ? Math.max(0, p[i + 6]! - p[prev + 6]!) : 18;
+  const spray = stroke.tool === "spray",
+    density = 0.1 + 0.9 * (stroke.density ?? 0.55);
+  const rate = spray ? (0.08 + p[i + 2]! * 0.65) * density : 0.055;
+  return Math.max(ms * rate, distance / Math.max(1, stroke.width * (spray ? 0.12 : 0.17)));
+}
+export function pigmentDabCount(stroke: Stroke, max: number): number {
+  let credit = 0,
+    total = 0;
+  const p = stroke.points;
+  for (let i = 0; i < p.length; i += STRIDE) {
+    const prev = Math.max(0, i - STRIDE);
+    credit += deposition(stroke, i, Math.hypot(p[i]! - p[prev]!, p[i + 1]! - p[prev + 1]!));
+    const n = Math.floor(credit);
+    credit -= n;
+    total += Math.max(n, i === 0 ? 1 : 0);
+    if (total > max) return total;
+  }
+  return total;
+}
+
 export function dabStream(stroke: Stroke) {
   let seed = (stroke.seed ?? stroke.seq) >>> 0;
   let credit = 0;
@@ -22,11 +46,9 @@ export function dabStream(stroke: Stroke) {
     const dy = p[i + 1]! - p[prev + 1]!;
     const distance = Math.hypot(dx, dy);
     const pressure = p[i + 2]!;
-    const ms = i ? Math.max(0, p[i + 6]! - p[prev + 6]!) : 18;
     const spray = stroke.tool === "spray";
     const density = 0.1 + 0.9 * (stroke.density ?? 0.55);
-    const rate = spray ? (0.08 + pressure * 0.65) * density : 0.055;
-    const amount = Math.max(ms * rate, distance / Math.max(1, stroke.width * (spray ? 0.12 : 0.17)));
+    const amount = deposition(stroke, i, distance);
     const start = credit;
     credit += amount;
     const count = Math.floor(credit);
@@ -83,7 +105,9 @@ interface Edge {
   slope: number;
 }
 
-export function polygonMesh(rings: number[][], vertex: (x: number, y: number) => void) {
+export function polygonMesh(rings: number[][], vertex?: (x: number, y: number) => void, limit = 300000): number {
+  let vertices = 0,
+    work = 0;
   const edges: Edge[] = [];
   const levels = new Set<number>();
   for (const p of rings)
@@ -114,6 +138,7 @@ export function polygonMesh(rings: number[][], vertex: (x: number, y: number) =>
       let j = byEnd.length;
       const endX = at(edge, end);
       while (j && at(byEnd[j - 1]!, end) > endX) {
+        if (++work > 2000000) return limit + 1;
         const left = byEnd[j - 1]!;
         const cross = y + (at(edge, y) - at(left, y)) / (left.slope - edge.slope);
         if (cross > y && cross < end) cuts.push(cross);
@@ -127,6 +152,9 @@ export function polygonMesh(rings: number[][], vertex: (x: number, y: number) =>
       const top = cuts[c - 1]!,
         bottom = cuts[c]!;
       if (top === bottom) continue;
+      vertices += Math.floor(active.length / 2) * 6;
+      if (vertices > limit) return limit + 1;
+      if (!vertex) continue;
       const mid = (top + bottom) / 2;
       active.sort((a, b) => at(a, mid) - at(b, mid));
       for (let j = 0; j + 1 < active.length; j += 2) {
@@ -141,4 +169,5 @@ export function polygonMesh(rings: number[][], vertex: (x: number, y: number) =>
       }
     }
   }
+  return vertices;
 }

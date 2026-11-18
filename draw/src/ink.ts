@@ -1,5 +1,4 @@
-import { dabStream, pathBounds, polygonMesh, strokeRings, type Dab } from "./pigments";
-import { smudgedPixels } from "./smudge";
+import { dabStream, pigmentDabCount, pathBounds, polygonMesh, strokeRings, type Dab } from "./pigments";
 import { apply, IDENTITY, type Bounds } from "./geometry";
 import { rgb, STRIDE, type Stroke, type Tool } from "./model";
 
@@ -47,12 +46,9 @@ export class Mesh {
     this.depth = Math.min(stroke.seq, DEPTH_STEPS) / DEPTH_STEPS;
   }
 
-  rgba(r: number, g: number, b: number, a: number) {
-    this.red = r;
-    this.green = g;
-    this.blue = b;
-    this.alpha = a;
-    this.ink = 0;
+  reveal(count: number) {
+    this.depth = count;
+    this.alpha = 255;
   }
 
   reset() {
@@ -386,10 +382,68 @@ export function trace(stroke: Stroke, out: Trace): Bounds {
   return bounds;
 }
 
+/** Counts ribbon subdivisions and joins without building their vertices. Untapered cap radii bound tapered caps. */
+export function estimateStrokeVertices(stroke: Stroke, limit: number): number {
+  if (stroke.patch) return 6;
+  const { tool, points: p, width } = stroke;
+  if (tool === "smudge") return 0;
+  if (tool === "spray" || tool === "airbrush") return pigmentDabCount(stroke, limit);
+  if (tool === "bucket" || tool === "lasso-fill") return polygonMesh(strokeRings(stroke), undefined, limit);
+  let count = 0,
+    stops = 0,
+    ax = 0,
+    ay = 0,
+    bx = 0,
+    by = 0,
+    ra = 0,
+    rb = 0;
+  const cap = (r: number) => 3 * Math.min(40, Math.max(12, Math.round(8 + r * 1.5)));
+  const sink: Sink = (x, y, pressure, tx, ty) => {
+    const [r] = shape(tool, width, pressure, tx, ty);
+    if (!stops) {
+      ax = x;
+      ay = y;
+      ra = r;
+      stops = 1;
+      return;
+    }
+    if (stops === 1) {
+      if (Math.hypot(x - ax, y - ay) < 0.05) {
+        ra = Math.max(ra, r);
+        return;
+      }
+      count += cap(ra);
+    } else {
+      const ox = x - bx,
+        oy = y - by,
+        len = Math.hypot(ox, oy);
+      if (len < 0.05) return;
+      const ix = bx - ax,
+        iy = by - ay;
+      count += 6;
+      if ((ix * ox + iy * oy) / ((Math.hypot(ix, iy) || 1) * len) < SHARP) count += cap(rb);
+      ax = bx;
+      ay = by;
+    }
+    bx = x;
+    by = y;
+    rb = r;
+    stops++;
+  };
+  const n = p.length / STRIDE;
+  for (let i = 0; i < n && count <= limit; i++) {
+    const k = i * STRIDE;
+    if (i === 0 || stroke.shape) sink(p[k]!, p[k + 1]!, p[k + 2]!, p[k + 3]!, p[k + 4]!);
+    else curve(p, n, i - 1, null, sink);
+  }
+  return count + (stops === 0 ? 0 : stops === 1 ? cap(ra) : 6 + cap(rb));
+}
+
 /** The whole stroke, end taper included: what is stored on the GPU once committed. */
 export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
   mesh.style(stroke);
-  if (stroke.tool === "bucket" && stroke.patch) {
+  if (stroke.patch) {
+    if (stroke.tool === "smudge") mesh.reveal(stroke.points.length / STRIDE);
     const patch = stroke.patch,
       m = patch.transform ?? IDENTITY;
     const bounds: Bounds = { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity };
@@ -413,7 +467,8 @@ export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
     return bounds;
   }
   if (stroke.tool === "bucket" || stroke.tool === "lasso-fill") {
-    polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0));
+    if (polygonMesh(strokeRings(stroke), (x, y) => mesh.vertex(x, y, 0, 1, 0, 0, 0), 300000) > 300000)
+      throw new Error("This fill has too many intersecting edges.");
     return pathBounds(stroke);
   }
   if (stroke.tool === "spray" || stroke.tool === "airbrush") {
@@ -422,45 +477,7 @@ export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
     for (let i = 0; i < stroke.points.length; i += STRIDE) add(i, emit);
     return pathBounds(stroke, stroke.width * (stroke.tool === "spray" ? 2 : 0.5));
   }
-  if (stroke.tool === "smudge") {
-    const patch = stroke.patch,
-      result = smudgedPixels(stroke);
-    if (patch && result) {
-      const { pixels, mask, w, h } = result;
-      const m = patch.transform ?? IDENTITY;
-      const vertex = (x: number, y: number) => {
-        const q = apply(m, x + patch.x, y + patch.y);
-        mesh.vertex(q.x, q.y, 0, 1, 0, 0, 0);
-      };
-      for (let y = 0; y < h; y++)
-        for (let x = 0; x < w;) {
-          const k = (y * w + x) * 4;
-          if (!mask[k / 4]) {
-            x++;
-            continue;
-          }
-          let end = x + 1;
-          while (
-            end < w &&
-            mask[y * w + end] &&
-            pixels[(y * w + end) * 4] === pixels[k] &&
-            pixels[(y * w + end) * 4 + 1] === pixels[k + 1] &&
-            pixels[(y * w + end) * 4 + 2] === pixels[k + 2] &&
-            pixels[(y * w + end) * 4 + 3] === pixels[k + 3]
-          )
-            end++;
-          mesh.rgba(pixels[k]!, pixels[k + 1]!, pixels[k + 2]!, pixels[k + 3]!);
-          vertex(x, y);
-          vertex(end, y);
-          vertex(x, y + 1);
-          vertex(x, y + 1);
-          vertex(end, y);
-          vertex(end, y + 1);
-          x = end;
-        }
-    }
-    return pathBounds(stroke, stroke.width / 2 + 1);
-  }
+  if (stroke.tool === "smudge") return pathBounds(stroke, stroke.width / 2);
   const ribbon = new Ribbon(mesh);
   const bounds = trace(stroke, (x, y, r, a, b, s) => ribbon.push(x, y, r, a, b, s));
   ribbon.finish();
@@ -534,8 +551,8 @@ export class LiveStroke implements LiveSource {
   /** Rebuilds the tail: the last curve, then the predicted readings, each `[x, y]` in document space. */
   build(predicted: readonly (readonly [number, number])[]) {
     this.tail.reset();
-    if (this.dabs) return;
-    if (this.stroke.tool === "lasso-fill" || this.stroke.tool === "smudge" || this.stroke.tool === "bucket") {
+    if (this.dabs || this.stroke.tool === "smudge") return;
+    if (this.stroke.tool === "lasso-fill" || this.stroke.tool === "bucket") {
       tessellate(this.stroke, this.tail);
       return;
     }

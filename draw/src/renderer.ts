@@ -1,10 +1,18 @@
+import { paintGroups, type PaintGroup } from "./paintGroups";
 import { BlendPass } from "./blend";
 import { floodContours, type BucketOptions } from "./bucket";
-import { base64, unpackPixels } from "./smudge";
-import { pathBounds } from "./pigments";
+import {
+  SmudgeSession,
+  cachedRaster,
+  loadRaster,
+  packRaster,
+  drawingPixels,
+  type RasterPlanes,
+  type PixelRect,
+} from "./smudge";
 import { IDENTITY, union, type Affine } from "./geometry";
 import { type Bounds, type LiveSource, Mesh, tessellate, VERTEX_BYTES } from "./ink";
-import { BLEND_MODES, type Layer, type Paper, type Stroke } from "./model";
+import { BLEND_MODES, INK, PAPER, rgb, STRIDE, type RasterPatch, type Layer, type Paper, type Stroke } from "./model";
 import { compositeShader, strokeShader } from "./shaders";
 
 const SAMPLES = 4;
@@ -27,19 +35,53 @@ interface Cached {
   bounds: Bounds;
 }
 
-const meshes = new WeakMap<Stroke, Cached>();
+const CPU_CACHE_BYTES = 176 * 1024 * 1024;
+const GPU_CACHE_BYTES = 192 * 1024 * 1024;
+const LAYER_CACHE_BYTES = 64 * 1024 * 1024;
+const PAGE_VERTICES = 131070;
+interface CacheSlot {
+  mesh?: Cached;
+}
+const meshes = new WeakMap<Stroke, CacheSlot>();
+const recent = new Set<CacheSlot>();
+let retainedBytes = 0;
+class DrawingCommands {
+  current: GPUCommandEncoder;
+  constructor(private device: GPUDevice) {
+    this.current = device.createCommandEncoder();
+  }
+  submit() {
+    this.device.queue.submit([this.current.finish()]);
+    this.current = this.device.createCommandEncoder();
+  }
+}
+
 const scratch = new Mesh(1 << 16);
 
 /** A stroke's triangles, tessellated the first time they are asked for. */
 export function meshOf(stroke: Stroke): Cached {
-  let cached = meshes.get(stroke);
-  if (!cached) {
-    scratch.reset();
-    const bounds = tessellate(stroke, scratch);
-    cached = { bytes: scratch.view().slice(), vertices: scratch.count, bounds };
-    meshes.set(stroke, cached);
+  const slot = meshes.get(stroke) ?? {};
+  if (slot.mesh) {
+    recent.delete(slot);
+    recent.add(slot);
+    return slot.mesh;
   }
-  return cached;
+  scratch.reset();
+  const bounds = tessellate(stroke, scratch);
+  const mesh = { bytes: scratch.view().slice(), vertices: scratch.count, bounds };
+  if (!mesh.bytes.length || mesh.bytes.length > CPU_CACHE_BYTES) return mesh;
+  while ((retainedBytes + mesh.bytes.length > CPU_CACHE_BYTES || recent.size >= 32000) && recent.size) {
+    const first = recent.values().next();
+    if (first.done) break;
+    retainedBytes -= first.value.mesh!.bytes.length;
+    delete first.value.mesh;
+    recent.delete(first.value);
+  }
+  slot.mesh = mesh;
+  meshes.set(stroke, slot);
+  recent.add(slot);
+  retainedBytes += mesh.bytes.length;
+  return mesh;
 }
 
 type Key =
@@ -70,11 +112,26 @@ const instanceKey = (key: Key) => key === "spray" || key === "airbrush";
 interface Run {
   locked: boolean;
   key: Key;
-  image?: { group: GPUBindGroup; buffer: GPUBuffer };
+  image?: RasterBinding;
+  patch?: RasterPatch;
+  scope?: number[];
   first: number;
   count: number;
 }
 
+interface RasterBinding {
+  buffer: GPUBuffer;
+  group: GPUBindGroup;
+  refs: number;
+  release(): void;
+}
+interface PreviewImage extends PixelRect {
+  buffer: GPUBuffer;
+  group: GPUBindGroup;
+  flags: number;
+}
+const sameScope = (a?: number[], b?: number[]) =>
+  a === b || ((a?.length ?? 0) === (b?.length ?? 0) && (!a || a.every((v, i) => v === b?.[i])));
 interface Target {
   texture: GPUTexture;
   view: GPUTextureView;
@@ -84,6 +141,9 @@ interface Target {
 class LayerGpu {
   buffer: GPUBuffer | null = null;
   capacity = 0;
+  limit = GPU_CACHE_BYTES;
+  streamed = false;
+  scoped = false;
   vertices = 0;
   strokes: Stroke[] = [];
   source: readonly Stroke[] | null = null;
@@ -100,8 +160,9 @@ class LayerGpu {
 
   destroy() {
     this.buffer?.destroy();
-    for (const run of this.runs) run.image?.buffer.destroy();
+    for (const run of this.runs) run.image?.release();
     this.target?.texture.destroy();
+    this.runs = [];
     this.opacityBuffer.destroy();
   }
 }
@@ -122,6 +183,7 @@ export interface Render {
   layer?: string;
   rawLayer?: boolean;
   pair?: readonly [Layer, Layer];
+  theme?: "light" | "dark";
 }
 
 type Rgb = readonly [number, number, number];
@@ -141,6 +203,7 @@ interface LiveItem {
   previewCount: number;
   previewAt: number;
   reading: boolean;
+  preview?: PreviewImage;
 }
 
 export class Renderer {
@@ -169,6 +232,7 @@ export class Renderer {
   private scheduled = false;
   private uniform = new Float32Array(24);
   private readonly fullOpacity: GPUBuffer;
+  private scopePipeline: GPURenderPipeline | null = null;
   private readonly viewBuffer: GPUBuffer;
   private readonly viewGroup: GPUBindGroup;
   private readonly identity: GPUBindGroup;
@@ -179,6 +243,13 @@ export class Renderer {
   private readonly screen: Composites;
   private offscreen: Composites | null = null;
   private blend: BlendPass | null = null;
+  private pageBuffer: GPUBuffer | null = null;
+  private pageBytes: Uint8Array<ArrayBuffer> | null = null;
+  private singleTarget: GPUTexture | null = null;
+  private readonly maxGeometry = GPU_CACHE_BYTES;
+  private readonly rasters = new WeakMap<Uint8Array, RasterBinding>();
+  private readonly loads = new Set<Promise<void>>();
+  private readonly smudges = new WeakMap<Stroke, { session: SmudgeSession; pending: Promise<void> }>();
   private readonly rasterLayout: GPUBindGroupLayout;
   private readonly textureLayout: GPUBindGroupLayout;
   private readonly viewLayout: GPUBindGroupLayout;
@@ -241,6 +312,11 @@ export class Renderer {
     for (const layer of layers) {
       let gpu = this.layers.get(layer.id);
       if (!gpu) this.layers.set(layer.id, (gpu = new LayerGpu(this.uniformBuffer(16))));
+      const limit = Math.min(192 * 1024 * 1024, Math.floor(this.maxGeometry / Math.max(1, layers.length)));
+      if (gpu.limit !== limit) {
+        gpu.limit = limit;
+        gpu.source = null;
+      }
       if (gpu.visible !== layer.visible) gpu.dirty = true;
       gpu.visible = layer.visible;
       const mode = BLEND_MODES.indexOf(layer.blendMode ?? "normal"),
@@ -300,6 +376,8 @@ export class Renderer {
     if (w === this.width && h === this.height && dpr === this.dpr && this.msaa) return;
     this.blend?.destroy();
     this.blend = null;
+    this.singleTarget?.destroy();
+    this.singleTarget = null;
     this.width = w;
     this.height = h;
     this.dpr = dpr;
@@ -348,24 +426,41 @@ export class Renderer {
           item.source.stroke.points.length !== item.previewAt
         ) {
           item.reading = true;
-          const stroke = { ...item.source.stroke, points: item.source.stroke.points.slice() };
+          const stroke = item.source.stroke;
           item.previewAt = stroke.points.length;
-          void this.smudge(stroke, live.layer)
-            .then((sample) => {
+          void this.advanceSmudge(stroke, live.layer, (session) => session)
+            .then((session) => {
               if (this.live !== live) return;
-              const mesh = meshOf(sample);
-              if (mesh.bytes.length > item.capacity || !item.buffer) {
-                item.buffer?.destroy();
-                item.capacity = Math.max(65536, mesh.bytes.length * 2);
-                item.buffer = this.device.createBuffer({
-                  size: item.capacity,
-                  usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
-                });
+              const domain = session.workspace;
+              if (!domain) return;
+              const prev = item.preview;
+              const resized =
+                !prev ||
+                prev.x !== domain.x ||
+                prev.y !== domain.y ||
+                prev.width !== domain.width ||
+                prev.height !== domain.height;
+              const pixels = session.result(!resized, true);
+              if (!pixels) return;
+              if (resized) {
+                prev?.buffer.destroy();
+                const flags = 3;
+                const buf = this.rasterBuffer(domain, flags);
+                item.preview = { ...domain, buffer: buf, flags, group: this.groupFor(this.rasterLayout, buf) };
               }
-              if (mesh.vertices) this.device.queue.writeBuffer(item.buffer, 0, mesh.bytes);
-              item.previewCount = mesh.vertices;
-              const target = this.layers.get(live.layer);
-              if (target) target.dirty = true;
+              const target = item.preview!;
+              this.uploadRaster(target.buffer, target.flags, target, pixels);
+              const mesh = new Mesh(6);
+              const stub: RasterPatch = { ...domain, png: new Uint8Array(0) };
+              tessellate({ ...stroke, patch: stub }, mesh);
+              item.buffer ??= this.device.createBuffer({
+                size: 6 * VERTEX_BYTES,
+                usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+              });
+              this.device.queue.writeBuffer(item.buffer, 0, mesh.view());
+              item.previewCount = 6;
+              const layer = this.layers.get(live.layer);
+              if (layer) layer.dirty = true;
               this.request();
             })
             .catch(() => {})
@@ -401,7 +496,10 @@ export class Renderer {
     if (!this.live) return;
     const gpu = this.layers.get(this.live.layer);
     if (gpu) gpu.dirty = true;
-    for (const item of this.live.items) item.buffer?.destroy();
+    for (const item of this.live.items) {
+      item.buffer?.destroy();
+      item.preview?.buffer.destroy();
+    }
     this.live = null;
     this.request();
   }
@@ -443,6 +541,7 @@ export class Renderer {
     scale: number,
     options: Render,
   ): Promise<{ pixels: Uint8ClampedArray; w: number; h: number }> {
+    if (this.loads.size) await this.rastersReady();
     const fit = Math.min(scale, MAX_EXPORT / (bounds.maxX - bounds.minX), MAX_EXPORT / (bounds.maxY - bounds.minY));
     const w = Math.max(1, Math.ceil((bounds.maxX - bounds.minX) * fit));
     const h = Math.max(1, Math.ceil((bounds.maxY - bounds.minY) * fit));
@@ -450,6 +549,12 @@ export class Renderer {
     const uniform = new Float32Array(24);
     const view = { zoom: 1, angle: 0, x: -bounds.minX, y: -bounds.minY };
     this.fillUniform(uniform, view, w, h, fit, false, options.pattern);
+    if (options.theme) {
+      uniform.set(
+        [...rgb(INK[options.theme]).map((c) => c / 255), 1, ...rgb(PAPER[options.theme]).map((c) => c / 255), 1],
+        8,
+      );
+    }
     const ubo = this.uniformBuffer(uniform.byteLength);
     device.queue.writeBuffer(ubo, 0, uniform);
     const group = this.groupFor(this.viewLayout, ubo);
@@ -475,12 +580,18 @@ export class Renderer {
       size: stride * h,
       usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
     });
-    const encoder = device.createCommandEncoder();
+    const commands = new DrawingCommands(device);
+    const transient: GPUTexture[] = [];
     const [r, g, b] = this.paper;
     const clear = options.background ? { r, g, b, a: 1 } : { r: 0, g: 0, b: 0, a: 0 };
-    const base = encoder.beginRenderPass({
+    const base = commands.current.beginRenderPass({
       colorAttachments: [
-        { view: blend?.begin(encoder) ?? out.createView(), clearValue: clear, loadOp: "clear", storeOp: "store" },
+        {
+          view: blend?.begin(commands.current) ?? out.createView(),
+          clearValue: clear,
+          loadOp: "clear",
+          storeOp: "store",
+        },
       ],
     });
     if (options.pattern && this.grid.opacity > 0) {
@@ -489,21 +600,23 @@ export class Renderer {
       base.draw(3);
     }
     base.end();
-    const glow = (options.background || !!options.pair || !!options.layer) && this.dark;
+    const glow =
+      (options.background || !!options.pair || !!options.layer) &&
+      (options.theme ? options.theme === "dark" : this.dark);
     for (const l of options.pair ?? this.order) {
       const gpu = this.layers.get(l.id);
       if (!gpu) continue;
-      if (!l.visible || !gpu.vertices) {
-        blend?.layer(encoder, null, gpu.opacityBuffer);
+      if ((!l.visible && !options.pair) || !gpu.vertices) {
+        blend?.layer(commands.current, null, gpu.opacityBuffer);
         continue;
       }
       if (options.layer && l.id !== options.layer) continue;
-      this.drawLayer(encoder, gpu, l.id, layerView, msaa.view, depth.view, group, false, glow);
+      this.drawLayer(commands, gpu, l.id, layerView, msaa.view, depth.view, group, false, glow, w, h, transient);
       if (blend) {
-        blend.layer(encoder, layerView, (l === options.pair?.[0] ? lowerParams : null) ?? gpu.opacityBuffer);
+        blend.layer(commands.current, layerView, (l === options.pair?.[0] ? lowerParams : null) ?? gpu.opacityBuffer);
         continue;
       }
-      const pass = encoder.beginRenderPass({
+      const pass = commands.current.beginRenderPass({
         colorAttachments: [{ view: out.createView(), loadOp: "load", storeOp: "store" }],
       });
       pass.setBindGroup(0, group);
@@ -513,7 +626,7 @@ export class Renderer {
       pass.end();
     }
     if (blend) {
-      const pass = encoder.beginRenderPass({
+      const pass = commands.current.beginRenderPass({
         colorAttachments: [
           { view: out.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
         ],
@@ -524,8 +637,12 @@ export class Renderer {
       pass.draw(3);
       pass.end();
     }
-    encoder.copyTextureToBuffer({ texture: out }, { buffer: readback, bytesPerRow: stride, rowsPerImage: h }, [w, h]);
-    device.queue.submit([encoder.finish()]);
+    commands.current.copyTextureToBuffer({ texture: out }, { buffer: readback, bytesPerRow: stride, rowsPerImage: h }, [
+      w,
+      h,
+    ]);
+    commands.submit();
+    for (const t of transient) t?.destroy();
     try {
       await readback.mapAsync(GPUMapMode.READ);
       const mapped = new Uint8Array(readback.getMappedRange());
@@ -611,7 +728,7 @@ export class Renderer {
   async mergeLayers(lower: Layer, upper: Layer, seq: number): Promise<Layer> {
     const merged: Layer = { ...lower, visible: lower.visible || upper.visible, opacity: 1, strokes: [] };
     let b: Bounds | null = null;
-    for (const l of [lower, upper]) if (l.visible) for (const s of l.strokes) b = union(b, meshOf(s).bounds);
+    for (const l of [lower, upper]) for (const s of l.strokes) b = union(b, meshOf(s).bounds);
     if (!b) return merged;
     const bounds = {
       minX: Math.floor(b.minX) - 1,
@@ -621,9 +738,12 @@ export class Renderer {
     };
     const w = bounds.maxX - bounds.minX,
       h = bounds.maxY - bounds.minY;
-    if (w > MAX_EXPORT || h > MAX_EXPORT || w * h > 16_777_216)
+    if (w > 4096 || h > 4096 || w * h > 2500000)
       throw new Error("These layers are too large to merge at document resolution.");
-    const image = await this.render(bounds, 1, { pair: [lower, upper], background: false, pattern: false });
+    const planes = await this.themedSample(bounds, { pair: [lower, upper], background: false, pattern: false }, [
+      lower,
+      upper,
+    ]);
     const { minX: x, minY: y, maxX: maxX, maxY: maxY } = bounds;
     const points = [x, y, 1, 0, 0, 0, 0, maxX, y, 1, 0, 0, 0, 0, maxX, maxY, 1, 0, 0, 0, 0, x, maxY, 1, 0, 0, 0, 0];
     return {
@@ -635,26 +755,143 @@ export class Renderer {
           color: "ink",
           width: 1,
           points,
-          patch: { x, y, width: w, height: h, rgba: base64(image.pixels) },
+          patch: await packRaster(planes),
         },
       ],
     };
   }
 
-  async smudge(stroke: Stroke, layer: string): Promise<Stroke> {
-    const b = pathBounds(stroke, stroke.width / 2 + 2);
-    const bounds = {
-      minX: Math.floor(b.minX),
-      minY: Math.floor(b.minY),
-      maxX: Math.ceil(b.maxX),
-      maxY: Math.ceil(b.maxY),
+  private async themedSample(bounds: Bounds, options: Render, layers: readonly Layer[]): Promise<RasterPlanes> {
+    const dual = layers.some((l) =>
+      l.strokes.some((s) => s.color === "ink" || s.tool === "marker" || s.patch?.darkPng),
+    );
+    const [day, night] = await Promise.all([
+      this.render(bounds, 1, { ...options, theme: "light" }),
+      dual ? this.render(bounds, 1, { ...options, theme: "dark" }) : undefined,
+    ]);
+    return {
+      x: bounds.minX,
+      y: bounds.minY,
+      width: day.w,
+      height: day.h,
+      light: drawingPixels(day.pixels),
+      ...(night && { dark: drawingPixels(night.pixels) }),
     };
-    const w = bounds.maxX - bounds.minX,
-      h = bounds.maxY - bounds.minY;
-    if (w > MAX_EXPORT || h > MAX_EXPORT || w * h > 16_777_216)
-      throw new Error("This smudge is too large for a document-resolution sample.");
-    const image = await this.render(bounds, 1, { background: false, pattern: false, layer, rawLayer: true });
-    return { ...stroke, patch: { x: bounds.minX, y: bounds.minY, width: w, height: h, rgba: base64(image.pixels) } };
+  }
+
+  private async advanceSmudge<T>(stroke: Stroke, layer: string, read: (s: SmudgeSession) => T): Promise<T> {
+    let state = this.smudges.get(stroke);
+    if (!state) {
+      state = { session: new SmudgeSession(stroke), pending: Promise.resolve() };
+      this.smudges.set(stroke, state);
+    }
+    const session = state.session;
+    const count = stroke.points.length / STRIDE;
+    const job = state.pending.then(async () => {
+      if (count <= session.processed) return read(session);
+      const b = session.bounds(stroke.points, count);
+      if (b) {
+        const source = this.order.find((l) => l.id === layer);
+        if (!source) throw new Error("The smudge layer is no longer available.");
+        session.supply(
+          await this.themedSample(
+            { minX: b.x, minY: b.y, maxX: b.x + b.width, maxY: b.y + b.height },
+            { layer, rawLayer: true, background: false, pattern: false },
+            [source],
+          ),
+        );
+      }
+      session.advance(stroke.points, count);
+      return read(session);
+    });
+    state.pending = job.then(
+      () => {},
+      () => {},
+    );
+    return job;
+  }
+
+  async smudge(stroke: Stroke, layer: string, checkpoint = false): Promise<Stroke> {
+    const length = stroke.points.length;
+    const result = await this.advanceSmudge(stroke, layer, (s) => s.result());
+    const frozen = checkpoint ? { ...stroke, points: stroke.points.slice(0, length) } : stroke;
+    if (!checkpoint) this.smudges.delete(stroke);
+    return result ? { ...frozen, patch: await packRaster(result) } : frozen;
+  }
+
+  async rastersReady() {
+    await Promise.all(this.loads);
+  }
+  private rasterBuffer(rect: PixelRect, flags: number) {
+    const planes = 1 + Number(!!(flags & 1)) + Number(!!(flags & 2));
+    const buffer = this.device.createBuffer({
+      size: 12 + 4 * rect.width * rect.height * planes,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(buffer, 0, new Uint32Array([rect.width, rect.height, flags]));
+    return buffer;
+  }
+  private uploadRaster(buffer: GPUBuffer, flags: number, domain: PixelRect, area: RasterPlanes) {
+    let base = 3;
+    for (const plane of [
+      area.light,
+      ...(flags & 1 ? [area.dark ?? area.light] : []),
+      ...(flags & 2 && area.coverage ? [area.coverage] : []),
+    ]) {
+      const x = area.x - domain.x,
+        y = area.y - domain.y;
+      if (domain.width === area.width) this.device.queue.writeBuffer(buffer, (base + y * domain.width) * 4, plane);
+      else
+        for (let row = 0; row < area.height; row++) {
+          const dest = base + (y + row) * domain.width + x;
+          this.device.queue.writeBuffer(buffer, dest * 4, plane.subarray(row * area.width, (row + 1) * area.width));
+        }
+      base += domain.width * domain.height;
+    }
+  }
+  private bindRaster(patch: RasterPatch, planes: RasterPlanes) {
+    let item = this.rasters.get(patch.png);
+    if (!item) {
+      const flags = Number(!!planes.dark) + 2 * Number(!!planes.coverage);
+      const buffer = this.rasterBuffer(planes, flags);
+      this.uploadRaster(buffer, flags, planes, planes);
+      const key = patch.png;
+      const resource: RasterBinding = {
+        buffer,
+        group: this.groupFor(this.rasterLayout, buffer),
+        refs: 0,
+        release: () => {
+          resource.refs--;
+          if (!resource.refs)
+            queueMicrotask(() => {
+              if (!resource.refs && this.rasters.get(key) === resource) {
+                this.rasters.delete(key);
+                resource.buffer.destroy();
+              }
+            });
+        },
+      };
+      this.rasters.set(key, resource);
+      item = resource;
+    }
+    item.refs++;
+    return item;
+  }
+  private attachRaster(run: Run, gpu: LayerGpu, patch: RasterPatch) {
+    const planes = cachedRaster(patch);
+    if (planes) {
+      run.image = this.bindRaster(patch, planes);
+      return;
+    }
+    const pending = loadRaster(patch).then((data) => {
+      if (gpu.runs.includes(run)) {
+        run.image = this.bindRaster(patch, data);
+        gpu.dirty = true;
+        this.request();
+      }
+    });
+    this.loads.add(pending);
+    void pending.finally(() => this.loads.delete(pending)).catch(() => {});
   }
 
   /** The colour on screen at a document point, as drawn at the current zoom. */
@@ -671,6 +908,8 @@ export class Renderer {
     this.endLive();
     this.dropFloat();
     this.blend?.destroy();
+    this.pageBuffer?.destroy();
+    this.singleTarget?.destroy();
     this.overlayBuffer?.destroy();
     this.context.unconfigure();
     this.device.destroy();
@@ -690,18 +929,45 @@ export class Renderer {
     if (!this.msaa || !this.depth) return;
     this.fillUniform(this.uniform, this.view, this.width, this.height, this.dpr, true, true);
     this.device.queue.writeBuffer(this.viewBuffer, 0, this.uniform);
-    const encoder = this.device.createCommandEncoder();
+    const commands = new DrawingCommands(this.device);
+    const transient: GPUTexture[] = [];
     const shown: LayerGpu[] = [];
     const glow = this.dark;
-    for (const layer of this.order) {
-      const gpu = this.layers.get(layer.id);
-      if (!gpu || !layer.visible) continue;
-      const live = this.live?.layer === layer.id;
-      const floating = this.float?.layer === layer.id;
-      if (!gpu.vertices && !live && !floating) continue;
+    const visible = (l: Layer, gpu: LayerGpu) =>
+      l.visible && (gpu.vertices > 0 || this.live?.layer === l.id || this.float?.layer === l.id);
+    const active = this.order.filter((l) => {
+      const gpu = this.layers.get(l.id);
+      return gpu && visible(l, gpu);
+    }).length;
+    const streaming = active * this.width * this.height * 4 > LAYER_CACHE_BYTES;
+    for (const l of this.order) {
+      const gpu = this.layers.get(l.id);
+      if (!gpu) continue;
+      if (streaming || !visible(l, gpu)) {
+        if (gpu.target) {
+          gpu.target.texture.destroy();
+          gpu.target = null;
+          gpu.dirty = true;
+        }
+        continue;
+      }
+      const recent = !!gpu.target;
       gpu.target ??= this.target(this.width, this.height, gpu);
-      if (gpu.dirty || this.viewChanged)
-        this.drawLayer(encoder, gpu, layer.id, gpu.target.view, this.msaa, this.depth, this.viewGroup, live, glow);
+      if (!recent || gpu.dirty || this.viewChanged)
+        this.drawLayer(
+          commands,
+          gpu,
+          l.id,
+          gpu.target.view,
+          this.msaa,
+          this.depth,
+          this.viewGroup,
+          this.live?.layer === l.id,
+          glow,
+          this.width,
+          this.height,
+          transient,
+        );
       gpu.dirty = false;
       shown.push(gpu);
     }
@@ -709,10 +975,11 @@ export class Renderer {
     this.viewChanged = false;
     const [r, g, b] = this.paper;
     const target = this.context.getCurrentTexture().createView();
-    const blend = this.needsBlend ? (this.blend ??= new BlendPass(this.device, this.width, this.height)) : null;
+    const blend =
+      streaming || this.needsBlend ? (this.blend ??= new BlendPass(this.device, this.width, this.height)) : null;
     const clear = { r, g, b, a: 1 };
-    const attachment = blend?.begin(encoder) ?? target;
-    let pass = encoder.beginRenderPass({
+    const attachment = blend?.begin(commands.current) ?? target;
+    let pass = commands.current.beginRenderPass({
       colorAttachments: [{ view: attachment, clearValue: clear, loadOp: "clear", storeOp: "store" }],
     });
     pass.setBindGroup(0, this.viewGroup);
@@ -722,12 +989,40 @@ export class Renderer {
     }
     if (blend) {
       pass.end();
-      const visible = new Set(shown);
+      const cached = new Set(shown);
+      let shared: GPUTextureView | null = null;
+      if (streaming) {
+        this.singleTarget ??= this.device.createTexture({
+          size: [this.width, this.height],
+          format: LAYER_FORMAT,
+          usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+        });
+        shared = this.singleTarget.createView();
+      }
       for (const l of this.order) {
         const gpu = this.layers.get(l.id);
-        if (gpu) blend.layer(encoder, visible.has(gpu) ? gpu.target!.view : null, gpu.opacityBuffer);
+        if (!gpu) continue;
+        let view = cached.has(gpu) ? gpu.target!.view : null;
+        if (shared && visible(l, gpu)) {
+          this.drawLayer(
+            commands,
+            gpu,
+            l.id,
+            shared,
+            this.msaa,
+            this.depth,
+            this.viewGroup,
+            this.live?.layer === l.id,
+            glow,
+            this.width,
+            this.height,
+            transient,
+          );
+          view = shared;
+        }
+        blend.layer(commands.current, view, gpu.opacityBuffer);
       }
-      pass = encoder.beginRenderPass({
+      pass = commands.current.beginRenderPass({
         colorAttachments: [{ view: target, clearValue: clear, loadOp: "clear", storeOp: "store" }],
       });
       pass.setBindGroup(0, this.viewGroup);
@@ -751,7 +1046,8 @@ export class Renderer {
       pass.draw(6);
     }
     pass.end();
-    this.device.queue.submit([encoder.finish()]);
+    commands.submit();
+    for (const t of transient) t?.destroy();
   }
 
   private uploadOverlay() {
@@ -771,61 +1067,230 @@ export class Renderer {
   }
 
   private drawLayer(
-    encoder: GPUCommandEncoder,
+    commands: DrawingCommands,
     gpu: LayerGpu,
     id: string,
-    resolve: GPUTextureView,
+    target: GPUTextureView,
     msaa: GPUTextureView,
     depth: GPUTextureView,
     group: GPUBindGroup,
     live: boolean,
     glow: boolean,
+    width: number,
+    height: number,
+    transient: GPUTexture[],
   ) {
-    const pass = encoder.beginRenderPass({
-      colorAttachments: [
-        {
-          view: msaa,
-          resolveTarget: resolve,
-          clearValue: { r: 0, g: 0, b: 0, a: 0 },
-          loadOp: "clear",
-          storeOp: "discard",
-        },
-      ],
-      depthStencilAttachment: { view: depth, depthClearValue: 0, depthLoadOp: "clear", depthStoreOp: "discard" },
-    });
-    pass.setBindGroup(0, group);
-    pass.setBindGroup(1, this.identity);
-    this.drawRuns(pass, gpu, glow);
-    const float = this.float;
-    if (float?.layer === id && float.gpu.vertices) {
-      pass.setBindGroup(1, this.floatGroup);
-      this.drawRuns(pass, float.gpu, glow);
+    const floating = this.float?.layer === id ? this.float.gpu : null;
+    const paintLive = (pass: GPURenderPassEncoder) => {
+      if (!live || this.live?.layer !== id) return;
+      pass.setBindGroup(0, group);
       pass.setBindGroup(1, this.identity);
-    }
-    if (live && this.live?.layer === id) {
       for (const item of this.live.items) {
-        const count =
-          item.source.stroke.tool === "smudge" ? item.previewCount : item.source.settled.count + item.source.tail.count;
+        const stroke = item.source.stroke;
+        const count = stroke.tool === "smudge" ? item.previewCount : item.source.settled.count + item.source.tail.count;
         if (!count || !item.buffer) continue;
+        const key = keyOf(stroke);
+        pass.setPipeline(this.pipeline(key, glow, !!stroke.alphaLocked));
         pass.setVertexBuffer(0, item.buffer);
-        const key = keyOf(item.source.stroke);
-        pass.setPipeline(this.pipeline(key, glow, item.source.stroke.alphaLocked ?? false));
+        if (item.preview) pass.setBindGroup(2, item.preview.group);
         if (instanceKey(key)) pass.draw(6, count);
         else pass.draw(count);
       }
+    };
+    if (!gpu.streamed && !gpu.scoped && !floating?.streamed && !floating?.scoped) {
+      const pass = commands.current.beginRenderPass({
+        colorAttachments: [
+          {
+            view: msaa,
+            resolveTarget: target,
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: "clear",
+            storeOp: "discard",
+          },
+        ],
+        depthStencilAttachment: { view: depth, depthClearValue: 0, depthLoadOp: "clear", depthStoreOp: "discard" },
+      });
+      pass.setBindGroup(0, group);
+      const batch = (gpu: LayerGpu, model: GPUBindGroup) => {
+        if (!gpu.buffer || !gpu.vertices) return;
+        pass.setVertexBuffer(0, gpu.buffer);
+        pass.setBindGroup(1, model);
+        for (const run of gpu.runs) {
+          if (run.patch && !run.image) continue;
+          pass.setPipeline(this.pipeline(run.key, glow, run.locked));
+          if (run.image) pass.setBindGroup(2, run.image.group);
+          if (instanceKey(run.key)) pass.draw(6, run.count, 0, run.first);
+          else pass.draw(run.count, 1, run.first);
+        }
+      };
+      batch(gpu, this.identity);
+      if (floating) batch(floating, this.floatGroup);
+      paintLive(pass);
+      pass.end();
+      return;
     }
-    pass.end();
+    type Surface = { view: GPUTextureView; texture: GPUTexture; group: GPUBindGroup };
+    const stack: Surface[][] = [];
+    const scratch = (level: number, slot: number): Surface => {
+      const pair = (stack[level] ??= []);
+      stack[level] = pair;
+      if (pair[slot]) return pair[slot]!;
+      const index = level * 2 + slot;
+      if (!transient[index] && (transient.filter(Boolean).length + 1) * width * height * 4 > 192 * 1024 * 1024)
+        throw new Error("The nested paint groups exceed the image memory available at this resolution.");
+      const t = (transient[index] ??= this.device.createTexture({
+        size: [width, height],
+        format: LAYER_FORMAT,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      }));
+      const view = t.createView();
+      return (pair[slot] = { view, texture: t, group: this.layerGroup(view, this.fullOpacity) });
+    };
+    const compose = (pass: GPURenderPassEncoder, src: GPUBindGroup) => {
+      pass.setPipeline(this.isolatePipeline());
+      pass.setBindGroup(0, group);
+      pass.setBindGroup(1, src);
+      pass.draw(3);
+    };
+    const draw = (
+      pass: GPURenderPassEncoder,
+      run: Run,
+      buffer: GPUBuffer,
+      model: GPUBindGroup,
+      first: number,
+      count: number,
+    ) => {
+      if (run.patch && !run.image) return;
+      pass.setPipeline(this.pipeline(run.key, glow, run.locked));
+      pass.setBindGroup(0, group);
+      pass.setBindGroup(1, model);
+      pass.setVertexBuffer(0, buffer);
+      if (run.image) pass.setBindGroup(2, run.image.group);
+      if (instanceKey(run.key)) pass.draw(6, count, 0, first);
+      else pass.draw(count, 1, first);
+    };
+    const scene = (dst: GPUTextureView, level: number) => {
+      let pass: GPURenderPassEncoder | null = null,
+        hasContent = false;
+      const open = () => {
+        if (pass) return pass;
+        const loadOp = hasContent ? "load" : "clear";
+        pass = commands.current.beginRenderPass({
+          colorAttachments: [
+            { view: msaa, resolveTarget: dst, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp, storeOp: "store" },
+          ],
+          depthStencilAttachment: { view: depth, depthClearValue: 0, depthLoadOp: loadOp, depthStoreOp: "store" },
+        });
+        hasContent = true;
+        return pass;
+      };
+      const end = () => {
+        if (pass) {
+          pass.end();
+          pass = null;
+        }
+      };
+      const paint = (source: LayerGpu, model: GPUBindGroup, items: readonly (Run | PaintGroup<Run>)[]) => {
+        let used = 0;
+        const pageRuns: { run: Run; first: number; count: number }[] = [];
+        const flush = () => {
+          if (!used) return;
+          end();
+          commands.submit();
+          const buffer = (this.pageBuffer ??= this.device.createBuffer({
+            size: PAGE_VERTICES * VERTEX_BYTES,
+            usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+          }));
+          this.device.queue.writeBuffer(buffer, 0, this.pageBytes!.subarray(0, used * VERTEX_BYTES));
+          const pass = open();
+          for (const item of pageRuns) draw(pass, item.run, buffer, model, item.first, item.count);
+          pageRuns.length = 0;
+          used = 0;
+        };
+        for (const item of items) {
+          if ("children" in item) {
+            flush();
+            end();
+            if (item.children.length === 1 && "children" in item.children[0]!) {
+              paint(source, model, item.children);
+              continue;
+            }
+            const parent = hasContent ? scratch(level, 0) : null;
+            if (parent) {
+              const save = commands.current.beginRenderPass({
+                colorAttachments: [
+                  { view: parent.view, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: "clear", storeOp: "store" },
+                ],
+              });
+              save.setPipeline((this.offscreen ??= this.composites(LAYER_FORMAT)).layer);
+              save.setBindGroup(0, group);
+              save.setBindGroup(1, this.layerGroup(dst, this.fullOpacity));
+              save.draw(3);
+              save.end();
+            }
+            const child = scratch(level, 1),
+              sub = scene(child.view, level + 1);
+            sub.paint(source, model, item.children);
+            sub.finish();
+            hasContent = false;
+            const next = open();
+            if (parent) compose(next, parent.group);
+            compose(next, child.group);
+          } else if (source.streamed) {
+            let at = item.first,
+              remaining = item.count;
+            while (remaining) {
+              let count = Math.min(remaining, PAGE_VERTICES - used);
+              if (!instanceKey(item.key)) count -= count % 3;
+              if (!count) {
+                flush();
+                continue;
+              }
+              this.copyPage(source, at, at + count, used);
+              pageRuns.push({ run: item, first: used, count });
+              used += count;
+              at += count;
+              remaining -= count;
+              if (used === PAGE_VERTICES) flush();
+            }
+          } else if (source.buffer) draw(open(), item, source.buffer, model, item.first, item.count);
+        }
+        flush();
+      };
+      return {
+        paint,
+        open,
+        finish: () => {
+          open();
+          end();
+        },
+      };
+    };
+    const root = scene(target, 0);
+    const items = (source: LayerGpu) =>
+      source.runs.some((r) => r.scope?.length) ? paintGroups(source.runs) : source.runs;
+    root.paint(gpu, this.identity, items(gpu));
+    if (this.float?.layer === id) root.paint(this.float.gpu, this.floatGroup, items(this.float.gpu));
+    if (live) paintLive(root.open());
+    root.finish();
   }
 
-  private drawRuns(pass: GPURenderPassEncoder, gpu: LayerGpu, glow: boolean) {
-    if (!gpu.buffer || !gpu.vertices) return;
-    pass.setVertexBuffer(0, gpu.buffer);
-    for (const run of gpu.runs) {
-      pass.setPipeline(this.pipeline(run.key, glow, run.locked));
-      if (run.image) pass.setBindGroup(2, run.image.group);
-      if (instanceKey(run.key)) pass.draw(6, run.count, 0, run.first);
-      else pass.draw(run.count, 1, run.first);
-    }
+  private isolatePipeline() {
+    if (this.scopePipeline) return this.scopePipeline;
+    const module = this.device.createShaderModule({ code: compositeShader });
+    const over = { srcFactor: "one", dstFactor: "one-minus-src-alpha" } as const;
+    return (this.scopePipeline = this.device.createRenderPipeline({
+      layout: this.device.createPipelineLayout({ bindGroupLayouts: [this.viewLayout, this.textureLayout] }),
+      vertex: { module, entryPoint: "vs_full" },
+      fragment: {
+        module,
+        entryPoint: "fs_layer",
+        targets: [{ format: LAYER_FORMAT, blend: { color: over, alpha: over } }],
+      },
+      primitive: { topology: "triangle-list" },
+      multisample: { count: SAMPLES },
+      depthStencil: { format: DEPTH_FORMAT, depthCompare: "always", depthWriteEnabled: false },
+    }));
   }
 
   private pipeline(key: Key, glow: boolean, locked: boolean): GPURenderPipeline {
@@ -838,64 +1303,95 @@ export class Renderer {
     if (gpu.source === strokes) return;
     gpu.source = strokes;
     let same = 0;
-    const n = Math.min(strokes.length, gpu.strokes.length);
-    while (same < n && gpu.strokes[same] === strokes[same]) same++;
-    if (same === strokes.length && same === gpu.strokes.length) return;
+    while (same < Math.min(strokes.length, gpu.strokes.length) && strokes[same] === gpu.strokes[same]) same++;
+    const unchanged = same === gpu.strokes.length && same === strokes.length;
     gpu.strokes.length = same;
     gpu.ends.length = same;
-    gpu.vertices = same ? gpu.ends[same - 1]! : 0;
-    const added = strokes.slice(same).map(meshOf);
-    const total = gpu.vertices + added.reduce((sum, m) => sum + m.vertices, 0);
-    this.reserve(gpu, total * VERTEX_BYTES);
-    while (gpu.runs.length && gpu.runs.at(-1)!.first >= gpu.vertices) gpu.runs.pop()!.image?.buffer.destroy();
+    const prefix = same ? gpu.ends[same - 1]! : 0;
+    while (gpu.runs.length && gpu.runs.at(-1)!.first >= prefix) gpu.runs.pop()!.image?.release();
     const tail = gpu.runs.at(-1);
-    if (tail) tail.count = gpu.vertices - tail.first;
-    let first = gpu.vertices;
-    const bytes = added.length === 1 ? added[0]!.bytes : new Uint8Array((total - first) * VERTEX_BYTES);
-    for (let i = 0; i < added.length; i++) {
-      const mesh = added[i]!,
-        stroke = strokes[same + i]!;
-      if (added.length > 1) bytes.set(mesh.bytes, (first - gpu.vertices) * VERTEX_BYTES);
+    if (tail) tail.count = prefix - tail.first;
+    let first = prefix;
+    for (let i = same; i < strokes.length; i++) {
+      const stroke = strokes[i]!,
+        count = meshOf(stroke).vertices;
       const key = keyOf(stroke),
-        locked = stroke.alphaLocked ?? false;
+        locked = stroke.alphaLocked ?? false,
+        scope = stroke.scope;
       const last = gpu.runs.at(-1);
-      if (key === "image" && stroke.patch) {
-        const patch = stroke.patch;
-        const pixels = unpackPixels(patch.rgba);
-        const buffer = this.device.createBuffer({
-          size: 8 + pixels.byteLength,
-          usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-        });
-        this.device.queue.writeBuffer(buffer, 0, new Uint32Array([patch.width, patch.height]));
-        this.device.queue.writeBuffer(buffer, 8, pixels);
-        gpu.runs.push({
-          key,
-          locked,
-          first,
-          count: mesh.vertices,
-          image: { buffer, group: this.groupFor(this.rasterLayout, buffer) },
-        });
-      } else if (last && last.key === key && last.locked === locked) last.count += mesh.vertices;
-      else if (mesh.vertices) gpu.runs.push({ key, locked, first, count: mesh.vertices });
-      first += mesh.vertices;
+      if (stroke.patch) {
+        const run: Run = { key, locked, first, count, patch: stroke.patch, ...(scope && { scope }) };
+        gpu.runs.push(run);
+        this.attachRaster(run, gpu, stroke.patch);
+      } else if (last && !last.patch && last.key === key && last.locked === locked && sameScope(last.scope, scope))
+        last.count += count;
+      else if (count) gpu.runs.push({ key, locked, first, count, ...(scope && { scope }) });
+      first += count;
       gpu.strokes.push(stroke);
       gpu.ends.push(first);
     }
-    if (bytes.length) this.device.queue.writeBuffer(gpu.buffer!, gpu.vertices * VERTEX_BYTES, bytes);
-    gpu.vertices = total;
+    const streamed = first * VERTEX_BYTES > gpu.limit;
+    if (unchanged && gpu.streamed === streamed && gpu.capacity <= gpu.limit) return;
+    const uploadFrom = gpu.streamed || gpu.capacity > gpu.limit ? 0 : prefix;
+    gpu.streamed = streamed;
+    if (streamed || gpu.capacity > gpu.limit) {
+      gpu.buffer?.destroy();
+      gpu.buffer = null;
+      gpu.capacity = 0;
+    }
+    gpu.vertices = first;
+    if (!streamed && first) {
+      this.reserve(gpu, first * VERTEX_BYTES, uploadFrom);
+      let start = uploadFrom;
+      while (start < first) {
+        const end = Math.min(first, start + PAGE_VERTICES);
+        const page = this.copyPage(gpu, start, end, 0);
+        this.device.queue.writeBuffer(
+          gpu.buffer!,
+          start * VERTEX_BYTES,
+          page.subarray(0, (end - start) * VERTEX_BYTES),
+        );
+        start = end;
+      }
+    }
+    gpu.scoped = gpu.runs.some((r) => r.scope?.length);
     gpu.dirty = true;
   }
 
-  private reserve(gpu: LayerGpu, bytes: number) {
+  private copyPage(gpu: LayerGpu, start: number, end: number, offset: number) {
+    const page = (this.pageBytes ??= new Uint8Array(PAGE_VERTICES * VERTEX_BYTES));
+    let lo = 0,
+      hi = gpu.ends.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (gpu.ends[mid]! <= start) lo = mid + 1;
+      else hi = mid;
+    }
+    for (let i = lo; start < end; i++) {
+      const first = i ? gpu.ends[i - 1]! : 0,
+        last = Math.min(end, gpu.ends[i]!);
+      if (last <= start) continue;
+      const mesh = meshOf(gpu.strokes[i]!);
+      page.set(
+        mesh.bytes.subarray((start - first) * VERTEX_BYTES, (last - first) * VERTEX_BYTES),
+        offset * VERTEX_BYTES,
+      );
+      offset += last - start;
+      start = last;
+    }
+    return page;
+  }
+
+  private reserve(gpu: LayerGpu, bytes: number, prefix: number) {
     if (gpu.buffer && bytes <= gpu.capacity) return;
-    const capacity = Math.max(bytes, gpu.capacity * 2, 1 << 16);
+    const capacity = Math.min(gpu.limit, Math.max(bytes, gpu.capacity * 1.5, 1 << 16));
     const next = this.device.createBuffer({
       size: capacity,
       usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
     });
-    if (gpu.buffer && gpu.vertices) {
+    if (gpu.buffer && prefix) {
       const encoder = this.device.createCommandEncoder();
-      encoder.copyBufferToBuffer(gpu.buffer, 0, next, 0, gpu.vertices * VERTEX_BYTES);
+      encoder.copyBufferToBuffer(gpu.buffer, 0, next, 0, prefix * VERTEX_BYTES);
       this.device.queue.submit([encoder.finish()]);
     }
     gpu.buffer?.destroy();
@@ -1020,7 +1516,7 @@ export class Renderer {
       image: make("fs_image", over, false),
       spray: make("fs_spray", over, false, over, true),
       airbrush: make("fs_airbrush", over, false, over, true),
-      smudge: make("fs_pen", replace, false),
+      smudge: make("fs_image", replace, false),
       pen: make("fs_pen", over, false),
       "pen+": make("fs_pen_layered", over, true),
       brush: make("fs_brush", over, false),

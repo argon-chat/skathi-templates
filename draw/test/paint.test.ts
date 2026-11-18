@@ -4,7 +4,7 @@ import { insidePolygon, transformStroke, translate } from "../src/geometry";
 import { LiveStroke, Mesh, tessellate } from "../src/ink";
 import type { Stroke } from "../src/model";
 import { dabStream, polygonMesh, type Dab } from "../src/pigments";
-import { base64, smudgedPixels } from "../src/smudge";
+import { SmudgeSession, drawingPixels } from "../src/smudge";
 
 function stroke(tool: Stroke["tool"]): Stroke {
   return {
@@ -99,25 +99,46 @@ test("even-odd triangulation accounts for a self crossing and a hole", () => {
   ).toBe(64);
 });
 
-test("pressure pulls pigment in fixed pixels, independent of a transformed document path", () => {
-  const w = 24,
-    h = 20,
-    pixels = new Uint8ClampedArray(w * h * 4);
-  for (let y = 0; y < h; y++)
-    for (let x = 0; x <= 8; x++) {
-      const k = (y * w + x) * 4;
-      pixels[k] = 255;
-      pixels[k + 3] = 255;
-    }
-  const s: Stroke = {
+test("the smudge updates only the new prefix, crops its result and renders as one transformed quad", () => {
+  const width = 24,
+    height = 20;
+  const brush: Stroke = {
     ...stroke("smudge"),
     width: 8,
-    points: [7, 10, 1, 0, 0, 0, 0, 15, 10, 1, 0, 0, 0, 80],
-    patch: { x: 0, y: 0, width: w, height: h, rgba: base64(pixels) },
+    points: [7, 10, 1, 0, 0, 0, 0, 11, 10, 1, 0, 0, 0, 40, 15, 10, 1, 0, 0, 0, 80],
   };
-  const original = smudgedPixels(s)!;
-  expect(original.pixels[(10 * w + 12) * 4 + 3]).toBeGreaterThan(0);
-  expect(smudgedPixels(transformStroke(s, translate(11, 4)))).toEqual(original);
-  const locked = smudgedPixels({ ...s, alphaLocked: true })!;
-  expect(locked.pixels[(10 * w + 12) * 4 + 3]).toBe(0);
+  const simulate = (locked: boolean, split: boolean) => {
+    const px = new Uint8ClampedArray(width * height * 4);
+    for (let y = 0; y < height; y++)
+      for (let x = 0; x <= 8; x++) {
+        const k = (y * width + x) * 4;
+        px[k] = 255;
+        px[k + 3] = 255;
+      }
+    const session = new SmudgeSession({ ...brush, alphaLocked: locked });
+    session.supply({ x: 0, y: 0, width, height, light: drawingPixels(px) });
+    if (split) {
+      session.advance(brush.points, 2);
+      expect(session.processed).toBe(2);
+    }
+    session.advance(brush.points, 3);
+    const result = session.result(false, true);
+    session.advance(brush.points, 3);
+    expect(session.result(true)).toBeNull();
+    return result;
+  };
+  const a = simulate(false, true)!;
+  expect(a).toEqual(simulate(false, false));
+  expect(a.width * a.height).toBeLessThan(width * height);
+  expect(a.light[(10 - a.y) * a.width + 12 - a.x]! >>> 24).toBeGreaterThan(0);
+  expect(simulate(true, true)).toBeNull();
+  const s = { ...brush, patch: { x: a.x, y: a.y, width: a.width, height: a.height, png: new Uint8Array([1]) } };
+  const m = new Mesh(),
+    moved = new Mesh();
+  const b = tessellate(s, m),
+    t = tessellate(transformStroke(s, translate(11, 4)), moved);
+  expect(m.count).toBe(6);
+  expect(moved.count).toBe(6);
+  expect(t.minX).toBe(b.minX + 11);
+  expect(t.minY).toBe(b.minY + 4);
 });

@@ -49,7 +49,7 @@ struct Result {@location(0) color:vec4f,@location(1) alpha:vec4f}
   let b=clamp(base.rgb/max(ba,0.00001),vec3f(0),vec3f(1));
   let s=clamp(source.rgb/max(ca,0.00001),vec3f(0),vec3f(1));
   let rgb=base.rgb*(1.0-ca)+source.rgb*(1.0-ba)+blend(b,s,u32(params.y))*ca*ba;
-  return Result(vec4f(rgb,ca+ba*(1.0-ca)),vec4f(ca));
+  return Result(vec4f(rgb,ca+ba*(1.0-ca)),vec4f(select(ca,textureLoad(mask,xy,0).r,params.z>0.5)));
 }
 `;
 
@@ -60,6 +60,10 @@ export class BlendPass {
   readonly masks: GPUTexture[];
   readonly blank: GPUTexture;
   private index = 0;
+  private readonly colorViews: GPUTextureView[];
+  private readonly maskViews: GPUTextureView[];
+  private readonly blankView: GPUTextureView;
+  private groups = new WeakMap<GPUTextureView, WeakMap<GPUBuffer, GPUBindGroup[]>>();
 
   constructor(
     private device: GPUDevice,
@@ -89,6 +93,9 @@ export class BlendPass {
     this.colors = [target("rgba8unorm"), target("rgba8unorm")];
     this.masks = [target("r8unorm"), target("r8unorm")];
     this.blank = target("rgba8unorm", 1, 1);
+    this.colorViews = this.colors.map((t) => t.createView());
+    this.maskViews = this.masks.map((t) => t.createView());
+    this.blankView = this.blank.createView();
   }
 
   begin(encoder: GPUCommandEncoder) {
@@ -97,7 +104,7 @@ export class BlendPass {
       .beginRenderPass({
         colorAttachments: [
           {
-            view: this.masks[0]!.createView(),
+            view: this.maskViews[0]!,
             clearValue: { r: 0, g: 0, b: 0, a: 0 },
             loadOp: "clear",
             storeOp: "store",
@@ -105,25 +112,36 @@ export class BlendPass {
         ],
       })
       .end();
-    return this.colors[0]!.createView();
+    return this.colorViews[0]!;
   }
 
   layer(encoder: GPUCommandEncoder, src: GPUTextureView | null, params: GPUBuffer) {
     const a = this.index,
       b = 1 - a;
-    const group = this.device.createBindGroup({
+    const source = src ?? this.blankView;
+    let byBuffer = this.groups.get(source);
+    if (!byBuffer) {
+      byBuffer = new WeakMap();
+      this.groups.set(source, byBuffer);
+    }
+    let pair = byBuffer.get(params);
+    if (!pair) {
+      pair = [];
+      byBuffer.set(params, pair);
+    }
+    const group = (pair[a] ??= this.device.createBindGroup({
       layout: this.layout,
       entries: [
-        { binding: 0, resource: src ?? this.blank.createView() },
-        { binding: 1, resource: this.colors[a]!.createView() },
-        { binding: 2, resource: this.masks[a]!.createView() },
+        { binding: 0, resource: source },
+        { binding: 1, resource: this.colorViews[a]! },
+        { binding: 2, resource: this.maskViews[a]! },
         { binding: 3, resource: { buffer: params } },
       ],
-    });
-    const views = [this.colors[b]!, this.masks[b]!];
+    }));
+    const views = [this.colorViews[b]!, this.maskViews[b]!];
     const pass = encoder.beginRenderPass({
-      colorAttachments: views.map((t) => ({
-        view: t.createView(),
+      colorAttachments: views.map((view) => ({
+        view,
         clearValue: { r: 0, g: 0, b: 0, a: 0 },
         loadOp: "clear" as const,
         storeOp: "store" as const,
@@ -137,7 +155,7 @@ export class BlendPass {
   }
 
   get view() {
-    return this.colors[this.index]!.createView();
+    return this.colorViews[this.index]!;
   }
   destroy() {
     for (const texture of [...this.colors, ...this.masks, this.blank]) texture.destroy();

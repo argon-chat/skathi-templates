@@ -109,7 +109,16 @@ fn eraser(i: Ink) -> vec4f {
 @fragment fn fs_image(i:Ink)->@location(0) vec4f {
   let dim=vec2u(raster[0],raster[1]);
   let p=min(vec2u(max(i.along,vec2f(0))),dim-vec2u(1));
-  let c=unpack4x8unorm(raster[2u+p.y*dim.x+p.x]);
+  let k=p.y*dim.x+p.x;
+  let count=dim.x*dim.y;
+  let flags=raster[2];
+  if((flags&2u)!=0u){
+    let offset=3u+count+select(0u,count,(flags&1u)!=0u);
+    let first=raster[offset+k]&16777215u;
+    if(first==0u || f32(first)>i.depth){discard;}
+  }
+  let shadeOffset=select(0u,count,(flags&1u)!=0u && dark_paper());
+  let c=unpack4x8unorm(raster[3u+shadeOffset+k]);
   return premultiply(c.rgb,c.a*i.color.a);
 }
 
