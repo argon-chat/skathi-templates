@@ -30,6 +30,13 @@ interface Job {
   parts: () => Promise<Bytes[]>;
   draft?: null | (() => Promise<Bytes>);
 }
+interface Prepared {
+  job: Job;
+  chunks: Bytes[];
+  draft: Bytes | null | undefined;
+}
+declare const requestIdleCallback: ((fn: () => void) => number) | undefined;
+declare const cancelIdleCallback: (id: number) => void;
 
 const request = <T>(req: IDBRequest<T>) =>
   new Promise<T>((resolve, reject) => {
@@ -54,7 +61,7 @@ async function openJournal() {
   };
   return request(db);
 }
-function persist(db: IDBDatabase, job: Job, parts: Bytes[], draft: Bytes | null | undefined) {
+function persist(db: IDBDatabase, batch: readonly Prepared[]) {
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(["session", "chunks"], "readwrite");
     const sessions = tx.objectStore("session"),
@@ -63,17 +70,21 @@ function persist(db: IDBDatabase, job: Job, parts: Bytes[], draft: Bytes | null 
     let conflict = false;
     current.onsuccess = () => {
       const stored = current.result;
-      if ((session(stored) ? stored.revision : 0) !== job.before) {
+      if ((session(stored) ? stored.revision : 0) !== batch[0]!.job.before) {
         conflict = true;
         tx.abort();
         return;
       }
-      if (job.reset) chunks.clear();
-      if (draft === null) sessions.delete("draft");
-      else if (draft) sessions.put(draft, "draft");
-      let i = job.head.chunks - parts.length;
-      for (const part of parts) chunks.put(part, i++);
-      sessions.put(job.head, "current");
+      let latestDraft: Bytes | null | undefined;
+      for (const part of batch) {
+        if (part.job.reset) chunks.clear();
+        if (part.draft !== undefined) latestDraft = part.draft;
+        let i = part.job.head.chunks - part.chunks.length;
+        for (const chunk of part.chunks) chunks.put(chunk, i++);
+      }
+      if (latestDraft === null) sessions.delete("draft");
+      else if (latestDraft) sessions.put(latestDraft, "draft");
+      sessions.put(batch.at(-1)!.job.head, "current");
     };
     tx.oncomplete = () => resolve();
     tx.onabort = () =>
@@ -88,12 +99,15 @@ export class EventRecorder {
   private batch: DrawEvent[] = [];
   private base = 0;
   private timer: ReturnType<typeof setTimeout> | undefined;
+  private scheduled: ReturnType<typeof setTimeout> | undefined;
+  private idle: number | undefined;
   private jobs: Job[] = [];
   private writing: Promise<void> | null = null;
   private failure: Error | null = null;
   private protectedFlag = false;
   private hasDraft = false;
   recoveredStroke: RecordedStroke | null = null;
+  metadata: DrawMeta | null = null;
   constructor(private readonly onError?: (error: Error) => void) {}
 
   get state(): RecordingState {
@@ -137,6 +151,9 @@ export class EventRecorder {
     ]);
     if (current !== undefined && !session(current)) throw new Error("Draw could not read the saved recording journal.");
     this.head = current ?? null;
+    if (this.head && header instanceof Uint8Array && metadata instanceof Uint8Array) {
+      this.metadata = (await decodeRecording(joinBytes([header, metadata]))).meta;
+    }
     this.protectedFlag = header instanceof Uint8Array && (header[8]! & 1) !== 0;
     this.base = performance.now() - (this.head?.elapsed ?? 0);
     if (this.head?.state === "recording" && draft !== undefined) {
@@ -160,6 +177,7 @@ export class EventRecorder {
     const before = this.head?.revision ?? 0;
     const header = recordingHeader(protectedFlag);
     this.protectedFlag = protectedFlag;
+    this.metadata = meta;
     this.hasDraft = false;
     this.recoveredStroke = null;
     this.base = performance.now();
@@ -193,7 +211,7 @@ export class EventRecorder {
     if (action.kind === "stroke") {
       this.seal(undefined, this.hasDraft ? null : undefined);
     } else if (this.timer === undefined) {
-      this.timer = setTimeout(() => this.seal(), 2000);
+      this.timer = setTimeout(() => this.seal(), 1750);
     }
   }
 
@@ -254,23 +272,48 @@ export class EventRecorder {
         return result;
       },
     });
-    if (!this.failure) void this.drain().catch(() => {});
+    if (!this.failure && !this.writing && this.scheduled === undefined) {
+      const write = () => {
+        void this.drain().catch(() => {});
+      };
+      // Keep each stroke's independently recoverable chunk, but share one storage transaction across quick strokes.
+      this.scheduled = setTimeout(
+        () => {
+          if (typeof requestIdleCallback !== "function") {
+            write();
+            return;
+          }
+          this.idle = requestIdleCallback(write);
+          this.scheduled = setTimeout(write, 32);
+        },
+        draft !== undefined ? 0 : 120,
+      );
+    }
   }
 
   private drain(): Promise<void> {
+    clearTimeout(this.scheduled);
+    this.scheduled = undefined;
+    if (this.idle !== undefined) {
+      cancelIdleCallback(this.idle);
+      this.idle = undefined;
+    }
     if (this.writing) return this.writing;
     if (!this.jobs.length) return Promise.resolve();
     this.failure = null;
     const run = async () => {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await Promise.resolve();
       try {
         while (this.jobs.length) {
-          const job = this.jobs[0]!;
           if (!this.db) throw new Error("Open the recording journal before saving.");
-          const parts = await job.parts();
-          const draft = job.draft ? await job.draft() : job.draft;
-          await persist(this.db, job, parts, draft);
-          this.jobs.shift();
+          const batch: Prepared[] = [];
+          for (const job of this.jobs.slice(0, 16)) {
+            const chunks = await job.parts();
+            const draft = job.draft ? await job.draft() : job.draft;
+            batch.push({ job, chunks, draft });
+          }
+          await persist(this.db, batch);
+          this.jobs.splice(0, batch.length);
         }
       } catch (cause: unknown) {
         this.failure =

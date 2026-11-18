@@ -1,7 +1,6 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef, watch, type ComputedRef } from "vue";
-import type { DrawUi } from "./events";
 import { PlaybackTimeline } from "./playbackTimeline";
-import { decodeRecording, RECORDING_MIME } from "./events";
+import { decodeRecording, RECORDING_MIME, type DrawUi } from "./events";
 import { EventRecorder, type RecordingState } from "./recorder";
 import { createPlayer, type PlayerFrame } from "./player";
 import type { View } from "./renderer";
@@ -40,6 +39,10 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
   let pendingView: ReturnType<typeof setTimeout> | undefined;
   let previousView = -Infinity;
   let recovering = true;
+  let initialized!: () => void;
+  const initialization = new Promise<void>((resolve) => {
+    initialized = resolve;
+  });
   let checkpointAt = 0;
   surface.enableInput(false);
   surface.onCancelDraft(() => rec.checkpoint(null));
@@ -183,7 +186,8 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
       await Promise.all([rec.stop(), book.flush()]);
     });
   async function open(bytes: Uint8Array) {
-    if (!ready.value || surface.painting()) throw new Error("Finish the current stroke before opening a recording.");
+    await initialization;
+    if (surface.painting()) throw new Error("Finish the current stroke before opening a recording.");
     if (active.value) throw new Error("Stop the current recording before opening another.");
     return player.open(bytes);
   }
@@ -255,6 +259,8 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
     try {
       await rec.recover();
       protect.value = rec.protected;
+      title.value = rec.metadata?.title ?? "";
+      author.value = rec.metadata?.author ?? "";
       sync();
       if (!book.ready.value)
         await new Promise<void>((resolve) => {
@@ -289,6 +295,7 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
       notify(e instanceof Error ? e.message : "Could not restore the recording.");
     } finally {
       recovering = false;
+      initialized();
       surface.enableInput(true);
     }
   });
@@ -300,7 +307,6 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
   });
   return {
     state,
-    elapsed,
     stamp,
     ready,
     busy,
