@@ -39,7 +39,7 @@ export function poppyStudy(nextSeq: () => number): Layer[] {
     mark(layer, color, width, (t) => bezier(curve, t));
   }
 
-  const makeLayer = (id: string, name: string): Draft => ({ id, name, visible: true, strokes: [] });
+  const makeLayer = (id: string, name: string): Draft => ({ id, name, visible: true, opacity: 1, strokes: [] });
   const stems = makeLayer("stems", "Stems & foliage");
   const petals = makeLayer("pigment", "Petal washes");
   const ink = makeLayer("ink", "Fine details");

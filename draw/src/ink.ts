@@ -1,4 +1,7 @@
+import type { Bounds } from "./geometry";
 import { rgb, STRIDE, type Stroke, type Tool } from "./model";
+
+export type { Bounds };
 
 /**
  * x, y (float32), edge/a/b/ink-flag (snorm8x4), colour (unorm8x4), depth (float32), then the
@@ -30,7 +33,7 @@ export class Mesh {
 
   style(stroke: Stroke) {
     const [r, g, b] = stroke.color === "ink" ? [0, 0, 0] : rgb(stroke.color);
-    const alpha = stroke.tool === "marker" ? 0.4 : stroke.tool === "pencil" ? 0.92 : 1;
+    const alpha = (stroke.tool === "marker" ? 0.4 : stroke.tool === "pencil" ? 0.92 : 1) * (stroke.opacity ?? 1);
     this.red = r;
     this.green = g;
     this.blue = b;
@@ -324,15 +327,10 @@ function curve(pts: ArrayLike<number>, count: number, i: number, after: ArrayLik
   }
 }
 
-export interface Bounds {
-  minX: number;
-  minY: number;
-  maxX: number;
-  maxY: number;
-}
+type Trace = (x: number, y: number, r: number, a: number, b: number, s: number) => void;
 
-/** The whole stroke, end taper included: what is stored on the GPU once committed. */
-export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
+/** Walks the finished stroke's outline samples: centre, radius, density, shading and distance along it. */
+export function trace(stroke: Stroke, out: Trace): Bounds {
   const { tool, width, points } = stroke;
   const count = points.length / STRIDE;
   const samples: number[] = [];
@@ -345,13 +343,14 @@ export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
     ly = y;
     samples.push(x, y, p, tx, ty, s);
   };
-  if (count > 0) sink(points[0]!, points[1]!, points[2]!, points[3]!, points[4]!);
-  for (let i = 0; i + 1 < count; i++) curve(points, count, i, null, sink);
+  for (let i = 0; i < count; i++) {
+    const k = i * STRIDE;
+    if (i === 0 || stroke.shape) sink(points[k]!, points[k + 1]!, points[k + 2]!, points[k + 3]!, points[k + 4]!);
+    else curve(points, count, i - 1, null, sink);
+  }
   const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-  const ribbon = new Ribbon(mesh);
-  mesh.style(stroke);
   const L = taperLength(width);
-  const tapered = tapers(tool) && samples.length > 6;
+  const tapered = !stroke.shape && tapers(tool) && samples.length > 6;
   const endL = Math.min(L, s * 0.45);
   for (let j = 0; j < samples.length; j += 6) {
     const x = samples[j]!;
@@ -359,18 +358,47 @@ export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
     const at = samples[j + 5]!;
     let [r, a, b] = shape(tool, width, samples[j + 2]!, samples[j + 3]!, samples[j + 4]!);
     if (tapered) r *= ease(at / L) * ease((s - at) / Math.max(endL, 1e-3));
-    ribbon.push(x, y, r, a, b, at);
+    out(x, y, r, a, b, at);
     bounds.minX = Math.min(bounds.minX, x - r);
     bounds.minY = Math.min(bounds.minY, y - r);
     bounds.maxX = Math.max(bounds.maxX, x + r);
     bounds.maxY = Math.max(bounds.maxY, y + r);
   }
+  return bounds;
+}
+
+/** The whole stroke, end taper included: what is stored on the GPU once committed. */
+export function tessellate(stroke: Stroke, mesh: Mesh): Bounds {
+  const ribbon = new Ribbon(mesh);
+  mesh.style(stroke);
+  const bounds = trace(stroke, (x, y, r, a, b, s) => ribbon.push(x, y, r, a, b, s));
   ribbon.finish();
   return bounds;
 }
 
+/** Geometry the renderer draws while a stroke is in progress. */
+export interface LiveSource {
+  readonly stroke: Stroke;
+  readonly settled: Mesh;
+  readonly tail: Mesh;
+}
+
+/** A shape being dragged out: rebuilt whole on every move, since every point moves. */
+export class LiveShape implements LiveSource {
+  readonly settled = new Mesh(1);
+  readonly tail = new Mesh(2048);
+
+  constructor(readonly stroke: Stroke) {}
+
+  set(points: number[]) {
+    this.stroke.points = points;
+    this.tail.reset();
+    if (points.length) tessellate(this.stroke, this.tail);
+  }
+}
+
 /** A stroke being drawn: settled geometry is appended once, the moving end is rebuilt each frame. */
-export class LiveStroke {
+export class LiveStroke implements LiveSource {
   readonly settled = new Mesh(4096);
   readonly tail = new Mesh(1024);
   private ribbon: Ribbon;
@@ -454,5 +482,54 @@ export class OneEuro {
     this.slope += alpha(1.2) * ((v - this.value) / dt - this.slope);
     this.value += alpha(this.minCutoff + this.beta * Math.abs(this.slope)) * (v - this.value);
     return this.value;
+  }
+}
+
+/**
+ * Pointer smoothing in screen pixels. At 0 it only takes out jitter; towards 1 the line also
+ * trails the pointer on a string, so it only bends where the hand meant it to.
+ */
+export class Stabilizer {
+  private readonly fx: OneEuro;
+  private readonly fy: OneEuro;
+  private readonly fp = new OneEuro(4, 0.02);
+  private readonly rope: number;
+  private x = 0;
+  private y = 0;
+  private started = false;
+
+  constructor(amount: number) {
+    const a = Math.min(1, Math.max(0, amount));
+    const cutoff = 6 * (1 - 0.8 * a);
+    const beta = 0.04 * (1 - 0.75 * a);
+    this.fx = new OneEuro(cutoff, beta);
+    this.fy = new OneEuro(cutoff, beta);
+    this.rope = a * a * 28;
+  }
+
+  /** The filtered position, or null while the pointer is still inside the string's slack. */
+  position(x: number, y: number, ms: number): { x: number; y: number } | null {
+    const fx = this.fx.filter(x, ms);
+    const fy = this.fy.filter(y, ms);
+    if (!this.started) {
+      this.started = true;
+      this.x = fx;
+      this.y = fy;
+      return { x: fx, y: fy };
+    }
+    const d = Math.hypot(fx - this.x, fy - this.y);
+    if (d <= this.rope) return this.rope ? null : { x: fx, y: fy };
+    const k = (d - this.rope) / d;
+    this.x += (fx - this.x) * k;
+    this.y += (fy - this.y) * k;
+    return { x: this.x, y: this.y };
+  }
+
+  pressure(p: number, ms: number): number {
+    return this.fp.filter(p, ms);
+  }
+
+  get trailing(): boolean {
+    return this.rope > 0;
   }
 }
