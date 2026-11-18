@@ -101,7 +101,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    border-radius: 8px;
+    border-radius: 10px;
+    corner-shape: squircle;
     color: #ffffff;
   }
   .tile.all {
@@ -127,7 +128,8 @@
     width: 30px;
     height: 30px;
     flex-shrink: 0;
-    border-radius: 6px;
+    border-radius: 10px;
+    corner-shape: squircle;
     object-fit: cover;
   }
   .blank {

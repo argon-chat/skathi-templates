@@ -1,4 +1,6 @@
 <script lang="ts">
+  import { flip } from "svelte/animate";
+  import { cubicOut } from "svelte/easing";
   import { fly } from "svelte/transition";
   import { inView, library, VIEWS } from "../lib/library.svelte";
   import { player } from "../lib/player.svelte";
@@ -20,56 +22,55 @@
   </header>
 
   <ul class="list">
-    {#each player.tracks as track, i (track.id)}
-      {#if inView(track, library.view)}
-        <li class="item" in:fly={{ y: 12, duration: 260 }}>
-          <div
-            class="row"
-            class:current={i === player.index}
-            onclick={() => (i === player.index ? player.toggle() : player.select(i))}
-            onkeydown={(e) => e.key === "Enter" && player.select(i)}
-            role="button"
-            tabindex="0"
-          >
-            <div class="thumb">
-              {#if track.cover}
-                <img class="thumb-art" src={track.cover} alt="" />
-              {:else}
-                <div
-                  class="thumb-art"
-                  style:--shading="cover({seedOf(track.id).toFixed(2)}, {track.palette.first}, {track.palette.second}, {track
-                    .palette.accent})"
-                ></div>
-              {/if}
-              {#if i === player.index}
-                <div class="eq" class:paused={!player.playing}>
-                  <span></span><span></span><span></span>
-                </div>
-              {/if}
-            </div>
-            <div class="meta">
-              <span class="name">{track.title}</span>
-              <span class="by"
-                >{#if player.liked.has(track.id)}<span class="heart"><Icon name="heart" size={11} /></span
-                  >{/if}{track.artist}</span
-              >
-            </div>
-            {#if typeof track.source !== "string"}
-              <button
-                class="remove"
-                title="Remove from the playlist"
-                onclick={(e) => {
-                  e.stopPropagation();
-                  player.remove(i);
-                }}
-              >
-                <Icon name="close" size={14} />
-              </button>
+    {#each shown as track (track.id)}
+      {@const i = player.tracks.indexOf(track)}
+      <li class="item" in:fly={{ y: 12, duration: 260 }} animate:flip={{ duration: 280, easing: cubicOut }}>
+        <div
+          class="row"
+          class:current={i === player.index}
+          onclick={() => (i === player.index ? player.toggle() : player.select(i))}
+          onkeydown={(e) => e.key === "Enter" && player.select(i)}
+          role="button"
+          tabindex="0"
+        >
+          <div class="thumb">
+            {#if track.cover}
+              <img class="thumb-art" src={track.cover} alt="" />
+            {:else}
+              <div
+                class="thumb-art"
+                style:--shading="cover({seedOf(track.id).toFixed(2)}, {track.palette.first}, {track.palette.second}, {track
+                  .palette.accent})"
+              ></div>
             {/if}
-            <span class="length">{clock(track.duration)}</span>
+            {#if i === player.index}
+              <div class="eq" class:paused={!player.playing}>
+                <span></span><span></span><span></span>
+              </div>
+            {/if}
           </div>
-        </li>
-      {/if}
+          <div class="meta">
+            <span class="name">{track.title}</span>
+            <span class="by"
+              >{#if player.liked.has(track.id)}<span class="heart"><Icon name="heart" size={11} /></span
+                >{/if}{track.artist}</span
+            >
+          </div>
+          {#if typeof track.source !== "string"}
+            <button
+              class="remove"
+              title="Remove from the playlist"
+              onclick={(e) => {
+                e.stopPropagation();
+                player.remove(i);
+              }}
+            >
+              <Icon name="close" size={14} />
+            </button>
+          {/if}
+          <span class="length">{clock(track.duration)}</span>
+        </div>
+      </li>
     {/each}
   </ul>
   {#if !shown.length}
@@ -140,7 +141,8 @@
     width: 44px;
     height: 44px;
     flex-shrink: 0;
-    border-radius: 12px;
+    border-radius: 14px;
+    corner-shape: squircle;
     overflow: hidden;
     background: #2b2836;
   }

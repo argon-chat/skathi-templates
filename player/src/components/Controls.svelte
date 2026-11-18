@@ -126,7 +126,8 @@
     width: 52px;
     height: 52px;
     flex-shrink: 0;
-    border-radius: 8px;
+    border-radius: 16px;
+    corner-shape: squircle;
     object-fit: cover;
   }
   .blank {
