@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from "vue";
-import { SWATCHES, TOOL_INFO, TOOLS, type Color, type Tool } from "../model";
+import { SWATCHES, TOOL_INFO, NIBS, PAINT_TOOLS, type Color, type Tool } from "../model";
 import { hideTip, showTip } from "../tooltip";
+import Icon from "./Icon.vue";
 import ToolGlyph from "./ToolGlyph.vue";
 
 const props = defineProps<{
@@ -14,7 +15,7 @@ const props = defineProps<{
   opacity: number;
   open: string | null;
 }>();
-const emit = defineEmits<{ tool: [Tool]; color: [Color]; brush: [Event]; palette: [Event] }>();
+const emit = defineEmits<{ tool: [Tool]; color: [Color]; paint: [Event]; brush: [Event]; palette: [Event] }>();
 
 const hex = (c: Color) => (c === "ink" ? props.ink : c);
 const custom = computed(() => !SWATCHES.includes(props.color));
@@ -26,9 +27,10 @@ const swatchNames: Record<string, string> = {
   "#FFB020": "Amber",
   "#A06BFF": "Violet",
 };
+const paintTool = computed(() => PAINT_TOOLS.find((t) => t === props.tool));
 const dot = computed(() => {
   const { min, max } = TOOL_INFO[props.brushTool];
-  const u = Math.sqrt((props.size - min) / (max - min));
+  const u = Math.sqrt((props.size - min) / Math.max(1, max - min));
   return Math.round(4 + Math.min(1, Math.max(0, u)) * 22);
 });
 const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : String(Math.round(props.size))));
@@ -38,7 +40,7 @@ const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : Strin
   <div class="toolbar pill" role="toolbar" aria-label="Drawing tools">
     <div class="tools" role="radiogroup" aria-label="Tool">
       <button
-        v-for="(t, i) in TOOLS"
+        v-for="(t, i) in NIBS"
         :key="t"
         :id="`tool-${t}`"
         class="tool"
@@ -55,6 +57,20 @@ const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : Strin
         <ToolGlyph :tool="t" :tip="t === 'eraser' ? '#D8B9BF' : hex(color)" :band="t === tool ? hex(color) : null" />
       </button>
     </div>
+    <span class="anchor paint-anchor">
+      <button
+        id="paint-tools"
+        class="icon-button"
+        :class="{ on: paintTool || open === 'paint' }"
+        aria-label="Painting tools"
+        :aria-expanded="open === 'paint'"
+        @click="emit('paint', $event)"
+        @pointerenter="showTip($event, paintTool ? TOOL_INFO[paintTool].name : 'Painting tools')"
+        @pointerleave="hideTip"
+      >
+        <Icon :name="paintTool ?? 'spray'" :size="23" />
+      </button>
+    </span>
     <i class="divider" />
     <div class="colors">
       <div class="swatches" role="radiogroup" aria-label="Colour">

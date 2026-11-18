@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import type { Tool } from "../model";
+import type { NIBS } from "../model";
 
+type Tool = (typeof NIBS)[number];
 const props = defineProps<{ tool: Tool; tip: string; band: string | null }>();
 const bands: Record<Tool, [number, number]> = {
   pen: [2.5, 23],

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
-import type { Layer } from "../model";
+import { BLEND_MODES, type BlendMode, type Layer } from "../model";
 import { hideTip, showTip } from "../tooltip";
 import Icon from "./Icon.vue";
 import Slider from "./Slider.vue";
@@ -17,6 +17,7 @@ const emit = defineEmits<{
   remove: [string];
   move: [string, number];
   rename: [string, string];
+  properties: [string, Partial<Pick<Layer, "blendMode" | "clipping" | "alphaLocked">>];
   opacity: [string, number, boolean];
 }>();
 
@@ -144,6 +145,41 @@ function nudge(e: KeyboardEvent, layer: Layer, index: number) {
       </li>
     </ul>
     <div v-if="current" class="opacity">
+      <label class="blend-select"
+        >Blend mode
+        <select
+          id="layer-blend"
+          aria-label="Blend mode"
+          :value="current.blendMode ?? 'normal'"
+          @change="
+            emit('properties', current!.id, { blendMode: ($event.target as HTMLSelectElement).value as BlendMode })
+          "
+        >
+          <option v-for="m in BLEND_MODES" :key="m" :value="m">
+            {{ m === "add" ? "Add (linear dodge)" : m.charAt(0).toUpperCase() + m.slice(1).replace("-", " ") }}
+          </option>
+        </select>
+      </label>
+      <div class="segmented">
+        <button
+          id="layer-clipping"
+          class="seg"
+          :class="{ on: current.clipping }"
+          :aria-pressed="!!current.clipping"
+          @click="emit('properties', current.id, { clipping: !current.clipping })"
+        >
+          Clip to below
+        </button>
+        <button
+          id="layer-lock"
+          class="seg"
+          :class="{ on: current.alphaLocked }"
+          :aria-pressed="!!current.alphaLocked"
+          @click="emit('properties', current.id, { alphaLocked: !current.alphaLocked })"
+        >
+          Lock alpha
+        </button>
+      </div>
       <Slider
         id="layer-opacity"
         label="Opacity"
@@ -298,7 +334,25 @@ function nudge(e: KeyboardEvent, layer: Layer, index: number) {
 .grip:focus-visible {
   outline: 2px solid #ffffffd0;
 }
+.blend-select {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  gap: 10px;
+}
+.blend-select select {
+  color: #f2f2f4;
+  background: #353539;
+  border: 0;
+  border-radius: 6px;
+  padding: 4px 6px;
+}
 .opacity {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px;
   margin-top: 6px;
 }
 .footer {

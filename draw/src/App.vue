@@ -1,6 +1,9 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { appWindow } from "@skathi-native/runtime";
+import { useRecordingSession } from "./recordingSession";
+import type { DrawUi } from "./events";
+import PlayerTransport from "./components/PlayerTransport.vue";
 import BrushPopover from "./components/BrushPopover.vue";
 import ColorPopover from "./components/ColorPopover.vue";
 import ExportPopover, { type Format } from "./components/ExportPopover.vue";
@@ -20,6 +23,8 @@ import {
   INK,
   isColor,
   isTool,
+  isInk,
+  PAINT_TOOLS,
   MODE_INFO,
   PAPER,
   PAPER_INFO,
@@ -43,7 +48,8 @@ import { useSurface } from "./surface";
 import { toSvg } from "./svg";
 import { hideTip, showTip, tip } from "./tooltip";
 
-type Popover = "layers" | "menu" | "export" | "brush" | "palette" | "shape" | "symmetry" | "view";
+type Popover =
+  "paint" | "recording" | "layers" | "menu" | "export" | "brush" | "palette" | "shape" | "symmetry" | "view";
 
 const scheme = matchMedia("(prefers-color-scheme: dark)");
 const dark = ref(scheme.matches);
@@ -82,6 +88,7 @@ const surface = useSurface({
   paper,
   symmetry,
   onPick: picked,
+  notify,
 });
 const { error, angle, drawing, effective, selected, cursor, ready: drawable } = surface;
 const viewState = { zoom: surface.zoom, angle };
@@ -90,6 +97,46 @@ const brushTool = computed<Tool>(() => {
   const m = effective.value;
   return isTool(m) ? m : mode.value === "shape" ? inkTool.value : lastTool.value;
 });
+const session = useRecordingSession({
+  book,
+  surface,
+  notify,
+  ui: computed<DrawUi>(() => ({
+    mode: mode.value,
+    color: color.value,
+    size: settings[brushTool.value].size,
+    active: active.value,
+    paper: paper.value,
+    dark: dark.value,
+    symmetry: symmetry.value ? { ...symmetry.value } : null,
+  })),
+  dismiss() {
+    open.value = null;
+    sheet.value = false;
+    hideTip();
+  },
+  restore(frame) {
+    const s = frame.ui;
+    if (s.mode) setMode(s.mode);
+    if (s.color) chooseColor(s.color);
+    if (s.size && isTool(mode.value)) settings[mode.value].size = s.size;
+    if (s.paper) paper.value = s.paper;
+    if (s.dark !== undefined) appWindow.theme = s.dark ? "dark" : "light";
+    symmetry.value = s.symmetry ?? null;
+  },
+});
+const {
+  player,
+  shown: playFrame,
+  cursor: playCursor,
+  stamp,
+  protect: protectRecording,
+  title: recordTitle,
+  author: recordAuthor,
+  state: recordState,
+} = session;
+const { loaded: inPlayer, hideUi: cleanPlayer } = player;
+Object.assign(window, { __draw: { open: session.open, play: player.play, seek: player.seek, pause: player.pause } });
 const hint = computed(() => ready.value && !error.value && strokeCount.value === 0 && !drawing.value);
 const lastStroke = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
 const caption = computed(
@@ -122,7 +169,7 @@ function setMode(m: Mode) {
   mode.value = m;
   if (isTool(m)) {
     lastTool.value = m;
-    if (m !== "eraser") inkTool.value = m;
+    if (isInk(m)) inkTool.value = m;
   }
   if (open.value === "shape" || open.value === "brush") open.value = null;
 }
@@ -164,6 +211,8 @@ function place(event: Event | Element | null, side: "below" | "above" | "right",
 }
 
 const SIDES: Record<Popover, ["below" | "above" | "right", number]> = {
+  paint: ["above", 220],
+  recording: ["below", 260],
   layers: ["below", 280],
   menu: ["below", 236],
   export: ["below", 272],
@@ -285,7 +334,7 @@ async function exportImage(action: "save" | "copy", format = exportFormat.value)
       const b = surface.bounds();
       if (!b) return;
       const mode = dark.value ? "dark" : "light";
-      const text = toSvg(layers.value, {
+      const text = await toSvg(layers.value, {
         bounds: { minX: b.minX - 32, minY: b.minY - 32, maxX: b.maxX + 32, maxY: b.maxY + 32 },
         ink: INK[mode],
         paper: PAPER[mode],
@@ -326,8 +375,20 @@ function outside(e: PointerEvent) {
 }
 
 function keydown(e: KeyboardEvent) {
+  if (inPlayer.value) {
+    if (e.key === "Escape") {
+      if (cleanPlayer.value) cleanPlayer.value = false;
+      else player.exit();
+    } else if (e.key === "Tab" && cleanPlayer.value) cleanPlayer.value = false;
+    else if (e.key === " " && (e.target as HTMLElement)?.tagName !== "BUTTON") {
+      if (player.playing.value) player.pause();
+      else void player.play().catch(() => {});
+    } else return;
+    e.preventDefault();
+    return;
+  }
   const tag = (e.target as HTMLElement | null)?.tagName;
-  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
   const key = e.key;
   const lower = key.toLowerCase();
   if (sheet.value) {
@@ -459,6 +520,13 @@ function restore(p: unknown) {
       if (number(s.size, info.min, info.max)) settings[t].size = s.size;
       if (number(s.opacity, 0.05, 1)) settings[t].opacity = s.opacity;
       if (number(s.streamline, 0, 1)) settings[t].streamline = s.streamline;
+      for (const k of ["hardness", "density", "scatter"] as const) if (number(s[k], 0, 1)) settings[t][k] = s[k];
+      if (t === "bucket") {
+        if (number(s.tolerance, 0, 255)) settings[t].tolerance = s.tolerance;
+        if (number(s.gap, 0, 12)) settings[t].gap = s.gap;
+        if (number(s.expand, 0, 2)) settings[t].expand = s.expand;
+        if (typeof s.currentLayer === "boolean") settings[t].currentLayer = s.currentLayer;
+      }
     }
   if (isColor(p.color)) color.value = p.color;
   if (Array.isArray(p.recents)) recents.value = p.recents.filter(isColor).slice(0, 12);
@@ -470,7 +538,7 @@ function restore(p: unknown) {
   if (p.scale === 1 || p.scale === 2 || p.scale === 4) exportScale.value = p.scale;
   if (typeof p.pattern === "boolean") exportPattern.value = p.pattern;
   if (typeof p.navigator === "boolean") navigatorOn.value = p.navigator;
-  if (isTool(p.inkTool) && p.inkTool !== "eraser") inkTool.value = p.inkTool;
+  if (isInk(p.inkTool)) inkTool.value = p.inkTool;
   if (isTool(p.mode)) setMode(p.mode);
 }
 
@@ -502,9 +570,14 @@ onBeforeUnmount(() => {
 <template>
   <main
     id="draw"
-    :class="{ dark }"
+    :class="{ dark: playFrame?.ui.dark ?? dark }"
+    :data-player="inPlayer"
+    :data-recording="recordState"
+    :data-elapsed="session.elapsed.value"
+    @dragover.prevent
+    @drop="session.drop"
     :data-ready="ready && drawable ? 'true' : 'false'"
-    :data-strokes="strokeCount"
+    :data-strokes="playFrame ? playFrame.layers.reduce((n, l) => n + l.strokes.length, 0) : strokeCount"
     :data-tool="mode"
     :data-effective-tool="effective"
     :data-last-tool="lastStroke"
@@ -535,333 +608,465 @@ onBeforeUnmount(() => {
       </p>
     </div>
 
-    <header class="strip">
-      <div class="cluster pill">
-        <button
-          id="undo"
-          class="icon-button"
-          aria-label="Undo"
-          :disabled="!canUndo"
-          @click="book.undo"
-          @pointerenter="showTip($event, 'Undo  Ctrl+Z', true)"
-          @focus="showTip($event, 'Undo  Ctrl+Z', true)"
-          @pointerleave="hideTip"
-          @blur="hideTip"
-        >
-          <Icon name="undo" />
-        </button>
-        <button
-          id="redo"
-          class="icon-button"
-          aria-label="Redo"
-          :disabled="!canRedo"
-          @click="book.redo"
-          @pointerenter="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
-          @focus="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
-          @pointerleave="hideTip"
-          @blur="hideTip"
-        >
-          <Icon name="redo" />
-        </button>
-      </div>
+    <input
+      id="record-file"
+      type="file"
+      accept=".skev,application/x-skathi-draw-events"
+      style="display: none"
+      @change="session.fileInput"
+    />
+    <template v-if="!inPlayer">
+      <header class="strip">
+        <div class="cluster pill">
+          <button
+            id="undo"
+            class="icon-button"
+            aria-label="Undo"
+            :disabled="!canUndo"
+            @click="book.undo"
+            @pointerenter="showTip($event, 'Undo  Ctrl+Z', true)"
+            @focus="showTip($event, 'Undo  Ctrl+Z', true)"
+            @pointerleave="hideTip"
+            @blur="hideTip"
+          >
+            <Icon name="undo" />
+          </button>
+          <button
+            id="redo"
+            class="icon-button"
+            aria-label="Redo"
+            :disabled="!canRedo"
+            @click="book.redo"
+            @pointerenter="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
+            @focus="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
+            @pointerleave="hideTip"
+            @blur="hideTip"
+          >
+            <Icon name="redo" />
+          </button>
+        </div>
 
-      <Transition name="fade">
-        <div
-          v-if="selected && effective === 'select'"
-          class="cluster pill selection-bar"
-          role="toolbar"
-          aria-label="Selection"
-        >
-          <span class="count">{{ selected }} selected</span>
-          <i class="bar-rule" />
-          <button
-            id="selection-duplicate"
-            class="icon-button"
-            aria-label="Duplicate"
-            @click="selectionAction('duplicate')"
-            @pointerenter="showTip($event, 'Duplicate  Ctrl+D', true)"
-            @pointerleave="hideTip"
+        <Transition name="fade">
+          <div
+            v-if="selected && effective === 'select'"
+            class="cluster pill selection-bar"
+            role="toolbar"
+            aria-label="Selection"
           >
-            <Icon name="copy" />
+            <span class="count">{{ selected }} selected</span>
+            <i class="bar-rule" />
+            <button
+              id="selection-duplicate"
+              class="icon-button"
+              aria-label="Duplicate"
+              @click="selectionAction('duplicate')"
+              @pointerenter="showTip($event, 'Duplicate  Ctrl+D', true)"
+              @pointerleave="hideTip"
+            >
+              <Icon name="copy" />
+            </button>
+            <button
+              id="selection-cut"
+              class="icon-button"
+              aria-label="Cut"
+              @click="selectionAction('cut')"
+              @pointerenter="showTip($event, 'Cut  Ctrl+X', true)"
+              @pointerleave="hideTip"
+            >
+              <Icon name="cut" />
+            </button>
+            <button
+              id="selection-delete"
+              class="icon-button"
+              aria-label="Delete"
+              @click="selectionAction('delete')"
+              @pointerenter="showTip($event, 'Delete  Del', true)"
+              @pointerleave="hideTip"
+            >
+              <Icon name="trash" />
+            </button>
+            <button
+              id="selection-clear"
+              class="icon-button"
+              aria-label="Deselect"
+              @click="selectionAction('clear')"
+              @pointerenter="showTip($event, 'Deselect  Esc', true)"
+              @pointerleave="hideTip"
+            >
+              <Icon name="close" />
+            </button>
+          </div>
+        </Transition>
+
+        <div class="end">
+          <div class="cluster pill anchor">
+            <button
+              id="recording"
+              class="record-button"
+              :class="{ active: session.active.value }"
+              aria-label="Recording"
+              :disabled="!session.ready.value || !ready"
+              @click="toggle('recording', $event)"
+              @pointerenter="showTip($event, 'Recording', true)"
+              @pointerleave="hideTip"
+            >
+              <i class="record-dot" :class="{ paused: recordState === 'paused' }" /><span v-if="session.active.value">{{
+                stamp
+              }}</span>
+            </button>
+          </div>
+          <div class="cluster pill anchor">
+            <button
+              id="export"
+              class="icon-button"
+              :class="{ on: open === 'export' }"
+              aria-label="Export"
+              :aria-expanded="open === 'export'"
+              @click="toggle('export', $event)"
+              @pointerenter="showTip($event, 'Export  Ctrl+Shift+E', true)"
+              @focus="showTip($event, 'Export  Ctrl+Shift+E', true)"
+              @pointerleave="hideTip"
+              @blur="hideTip"
+            >
+              <Icon name="export" />
+            </button>
+            <button
+              id="layers"
+              class="icon-button"
+              :class="{ on: open === 'layers' }"
+              aria-label="Layers"
+              :aria-expanded="open === 'layers'"
+              @click="toggle('layers', $event)"
+              @pointerenter="showTip($event, 'Layers', true)"
+              @focus="showTip($event, 'Layers', true)"
+              @pointerleave="hideTip"
+              @blur="hideTip"
+            >
+              <Icon name="layers" />
+            </button>
+            <button
+              id="menu"
+              class="icon-button"
+              :class="{ on: open === 'menu' }"
+              aria-label="More"
+              :aria-expanded="open === 'menu'"
+              @click="toggle('menu', $event)"
+              @pointerenter="showTip($event, 'More', true)"
+              @focus="showTip($event, 'More', true)"
+              @pointerleave="hideTip"
+              @blur="hideTip"
+            >
+              <Icon name="more" />
+            </button>
+          </div>
+          <WindowControls v-if="caption" />
+        </div>
+      </header>
+
+      <ToolRail
+        :mode="effective"
+        :shape="shape"
+        :symmetry="symmetry !== null"
+        :open="open"
+        @mode="setMode"
+        @flyout="(which, e) => toggle(which, e)"
+      />
+
+      <Transition name="pop">
+        <LayersPopover
+          v-if="open === 'layers'"
+          :style="placement"
+          :layers="layers"
+          :active="active"
+          @select="book.selectLayer"
+          @toggle="book.toggleLayer"
+          @add="book.addLayer"
+          @duplicate="book.duplicateLayer"
+          @merge="book.mergeDown"
+          @remove="book.deleteLayer"
+          @move="book.moveLayer"
+          @rename="book.renameLayer"
+          @properties="book.setProperties"
+          @opacity="layerOpacity"
+        />
+      </Transition>
+      <Transition name="pop">
+        <ExportPopover
+          v-if="open === 'export'"
+          :style="placement"
+          :format="exportFormat"
+          :scale="exportScale"
+          :pattern="exportPattern"
+          :paper="paper !== 'plain'"
+          :busy="busy"
+          @format="(f) => (exportFormat = f)"
+          @scale="(s) => (exportScale = s)"
+          @pattern="(p) => (exportPattern = p)"
+          @save="exportImage('save')"
+          @copy="exportImage('copy')"
+        />
+      </Transition>
+      <Transition name="pop">
+        <div v-if="open === 'menu'" class="popover pill menu" :style="placement" role="menu" aria-label="More">
+          <button id="new-drawing" class="item" role="menuitem" @click="newDrawing">
+            <Icon name="page" :size="16" />New drawing
           </button>
-          <button
-            id="selection-cut"
-            class="icon-button"
-            aria-label="Cut"
-            @click="selectionAction('cut')"
-            @pointerenter="showTip($event, 'Cut  Ctrl+X', true)"
-            @pointerleave="hideTip"
-          >
-            <Icon name="cut" />
+          <button id="load-sample" class="item" role="menuitem" @click="loadSample">
+            <Icon name="flower" :size="16" />Load sample
           </button>
-          <button
-            id="selection-delete"
-            class="icon-button"
-            aria-label="Delete"
-            @click="selectionAction('delete')"
-            @pointerenter="showTip($event, 'Delete  Del', true)"
-            @pointerleave="hideTip"
-          >
-            <Icon name="trash" />
+          <i class="rule" />
+          <button id="menu-recording" class="item" @click="openFrom('recording', 'recording')">
+            <Icon name="record" :size="16" />Recording…
           </button>
-          <button
-            id="selection-clear"
-            class="icon-button"
-            aria-label="Deselect"
-            @click="selectionAction('clear')"
-            @pointerenter="showTip($event, 'Deselect  Esc', true)"
-            @pointerleave="hideTip"
-          >
-            <Icon name="close" />
+          <button id="menu-open-recording" class="item" :disabled="session.active.value" @click="session.choose">
+            Open recording…
+          </button>
+          <i class="rule" />
+          <p class="heading">Paper</p>
+          <div class="segmented papers" role="radiogroup" aria-label="Paper">
+            <button
+              v-for="p in PAPERS"
+              :id="`paper-${p}`"
+              :key="p"
+              class="seg"
+              :class="{ on: p === paper }"
+              role="radio"
+              :aria-checked="p === paper"
+              :aria-label="PAPER_INFO[p].name"
+              @click="paper = p"
+              @pointerenter="showTip($event, `${PAPER_INFO[p].name}  G`)"
+              @pointerleave="hideTip"
+            >
+              <Icon :name="p === 'dots' ? 'grid' : p" />
+            </button>
+          </div>
+          <i class="rule" />
+          <button id="show-shortcuts" class="item" role="menuitem" @click="((open = null), (sheet = true))">
+            <Icon name="keyboard" :size="16" />Keyboard shortcuts<kbd class="shortcut">?</kbd>
+          </button>
+          <i class="rule" />
+          <button id="clear" class="item danger" role="menuitem" :disabled="!strokeCount" @click="clear">
+            <Icon name="erase" :size="16" />Clear
           </button>
         </div>
       </Transition>
-
-      <div class="end">
-        <div class="cluster pill anchor">
-          <button
-            id="export"
-            class="icon-button"
-            :class="{ on: open === 'export' }"
-            aria-label="Export"
-            :aria-expanded="open === 'export'"
-            @click="toggle('export', $event)"
-            @pointerenter="showTip($event, 'Export  Ctrl+Shift+E', true)"
-            @focus="showTip($event, 'Export  Ctrl+Shift+E', true)"
-            @pointerleave="hideTip"
-            @blur="hideTip"
-          >
-            <Icon name="export" />
+      <Transition name="pop">
+        <BrushPopover
+          v-if="open === 'brush'"
+          :style="placement"
+          :tool="brushTool"
+          :settings="settings[brushTool]"
+          :paper="PAPER[dark ? 'dark' : 'light']"
+          :color="color === 'ink' ? ink : color"
+          :shape="mode === 'shape'"
+          @change="changeSettings"
+          @reset="resetSettings"
+        />
+      </Transition>
+      <Transition name="pop">
+        <ColorPopover
+          v-if="open === 'palette'"
+          :style="placement"
+          :color="color"
+          :ink="ink"
+          :recents="recents"
+          @color="chooseColor"
+          @eyedropper="sampleColour"
+        />
+      </Transition>
+      <Transition name="pop">
+        <ShapePopover
+          v-if="open === 'shape'"
+          :style="placement"
+          :shape="shape"
+          :ink="inkTool"
+          @shape="(s) => ((shape = s), (open = null))"
+        />
+      </Transition>
+      <Transition name="pop">
+        <SymmetryPopover
+          v-if="open === 'symmetry'"
+          :style="placement"
+          :symmetry="symmetry"
+          :last="lastSymmetry"
+          @change="setSymmetry"
+          @centre="centreSymmetry"
+        />
+      </Transition>
+      <Transition name="pop">
+        <div
+          v-if="open === 'view'"
+          class="popover pill menu view-menu"
+          :style="placement"
+          role="menu"
+          aria-label="View"
+        >
+          <button id="zoom-actual" class="item" role="menuitem" @click="surface.zoomTo(1)">
+            <Icon name="page" :size="16" />Actual size<kbd class="shortcut">Ctrl+0</kbd>
           </button>
-          <button
-            id="layers"
-            class="icon-button"
-            :class="{ on: open === 'layers' }"
-            aria-label="Layers"
-            :aria-expanded="open === 'layers'"
-            @click="toggle('layers', $event)"
-            @pointerenter="showTip($event, 'Layers', true)"
-            @focus="showTip($event, 'Layers', true)"
-            @pointerleave="hideTip"
-            @blur="hideTip"
-          >
-            <Icon name="layers" />
+          <button id="zoom-fit" class="item" role="menuitem" @click="surface.fitContent()">
+            <Icon name="fit" :size="16" />Fit drawing<kbd class="shortcut">Shift+1</kbd>
           </button>
-          <button
-            id="menu"
-            class="icon-button"
-            :class="{ on: open === 'menu' }"
-            aria-label="More"
-            :aria-expanded="open === 'menu'"
-            @click="toggle('menu', $event)"
-            @pointerenter="showTip($event, 'More', true)"
-            @focus="showTip($event, 'More', true)"
-            @pointerleave="hideTip"
-            @blur="hideTip"
-          >
-            <Icon name="more" />
-          </button>
+          <i class="rule" />
+          <p class="heading">Rotation</p>
+          <div class="rotation">
+            <button
+              id="rotate-left"
+              class="icon-button"
+              aria-label="Rotate left"
+              @click="surface.rotateBy(-15)"
+              @pointerenter="showTip($event, 'Rotate left  ,')"
+              @pointerleave="hideTip"
+            >
+              <Icon name="rotate-left" />
+            </button>
+            <span class="degrees">{{ angle }}°</span>
+            <button
+              id="rotate-right"
+              class="icon-button"
+              aria-label="Rotate right"
+              @click="surface.rotateBy(15)"
+              @pointerenter="showTip($event, 'Rotate right  .')"
+              @pointerleave="hideTip"
+            >
+              <Icon name="rotate-right" />
+            </button>
+            <button id="rotate-reset" class="text-button small" :disabled="!angle" @click="surface.resetRotation()">
+              <Icon name="compass" :size="16" />Reset
+            </button>
+          </div>
         </div>
-        <WindowControls v-if="caption" />
-      </div>
-    </header>
+      </Transition>
 
-    <ToolRail
-      :mode="effective"
-      :shape="shape"
-      :symmetry="symmetry !== null"
-      :open="open"
-      @mode="setMode"
-      @flyout="(which, e) => toggle(which, e)"
-    />
+      <p class="hint" :class="{ shown: hint }" aria-hidden="true">
+        Draw anywhere. Pinch or Ctrl+scroll to zoom. Press ? for shortcuts.
+      </p>
 
-    <Transition name="pop">
-      <LayersPopover
-        v-if="open === 'layers'"
+      <div
+        v-if="open === 'recording'"
+        class="popover pill menu recording-panel"
         :style="placement"
-        :layers="layers"
-        :active="active"
-        @select="book.selectLayer"
-        @toggle="book.toggleLayer"
-        @add="book.addLayer"
-        @duplicate="book.duplicateLayer"
-        @merge="book.mergeDown"
-        @remove="book.deleteLayer"
-        @move="book.moveLayer"
-        @rename="book.renameLayer"
-        @opacity="layerOpacity"
-      />
-    </Transition>
-    <Transition name="pop">
-      <ExportPopover
-        v-if="open === 'export'"
-        :style="placement"
-        :format="exportFormat"
-        :scale="exportScale"
-        :pattern="exportPattern"
-        :paper="paper !== 'plain'"
-        :busy="busy"
-        @format="(f) => (exportFormat = f)"
-        @scale="(s) => (exportScale = s)"
-        @pattern="(p) => (exportPattern = p)"
-        @save="exportImage('save')"
-        @copy="exportImage('copy')"
-      />
-    </Transition>
-    <Transition name="pop">
-      <div v-if="open === 'menu'" class="popover pill menu" :style="placement" role="menu" aria-label="More">
-        <button id="new-drawing" class="item" role="menuitem" @click="newDrawing">
-          <Icon name="page" :size="16" />New drawing
-        </button>
-        <button id="load-sample" class="item" role="menuitem" @click="loadSample">
-          <Icon name="flower" :size="16" />Load sample
-        </button>
-        <i class="rule" />
-        <p class="heading">Paper</p>
-        <div class="segmented papers" role="radiogroup" aria-label="Paper">
-          <button
-            v-for="p in PAPERS"
-            :id="`paper-${p}`"
-            :key="p"
-            class="seg"
-            :class="{ on: p === paper }"
-            role="radio"
-            :aria-checked="p === paper"
-            :aria-label="PAPER_INFO[p].name"
-            @click="paper = p"
-            @pointerenter="showTip($event, `${PAPER_INFO[p].name}  G`)"
-            @pointerleave="hideTip"
-          >
-            <Icon :name="p === 'dots' ? 'grid' : p" />
+        role="dialog"
+        aria-label="Recording"
+      >
+        <p class="heading">Recording</p>
+        <template v-if="!session.active.value">
+          <input
+            v-model="recordTitle"
+            aria-label="Recording title"
+            placeholder="Title (optional)"
+            class="record-field"
+          />
+          <input v-model="recordAuthor" aria-label="Artist name" placeholder="Artist (optional)" class="record-field" />
+          <button id="record-start" class="item" :disabled="session.busy.value" @click="session.start">
+            <Icon name="record" :size="16" />{{
+              recordState === "stopped" ? "Start a new recording" : "Start recording"
+            }}
           </button>
-        </div>
+          <small v-if="recordState === 'stopped'">Starting again replaces the recording saved in Draw.</small>
+        </template>
+        <template v-else>
+          <button v-if="recordState === 'recording'" id="record-pause" class="item" @click="session.pause">
+            Pause recording
+          </button>
+          <button v-else id="record-resume" class="item" @click="session.resume">Resume recording</button>
+          <button id="record-stop" class="item" @click="session.stop">Stop recording</button>
+        </template>
         <i class="rule" />
-        <button id="show-shortcuts" class="item" role="menuitem" @click="((open = null), (sheet = true))">
-          <Icon name="keyboard" :size="16" />Keyboard shortcuts<kbd class="shortcut">?</kbd>
+        <button
+          id="record-protect"
+          class="item"
+          role="checkbox"
+          :aria-checked="protectRecording"
+          @click="protectRecording = !protectRecording"
+        >
+          <Icon :name="protectRecording ? 'check' : 'rect'" :size="15" />Protect recording
         </button>
+        <small>View-only flag. The file is unencrypted.</small>
         <i class="rule" />
-        <button id="clear" class="item danger" role="menuitem" :disabled="!strokeCount" @click="clear">
-          <Icon name="erase" :size="16" />Clear
+        <button
+          id="record-save"
+          class="item"
+          :disabled="recordState === 'idle' || session.busy.value"
+          @click="session.save"
+        >
+          Save recording…
+        </button>
+        <button v-if="recordState === 'stopped'" id="record-preview" class="item" @click="session.preview">
+          Play this recording
+        </button>
+        <button
+          id="record-open"
+          class="item"
+          :disabled="session.active.value || session.busy.value"
+          @click="session.choose"
+        >
+          Open recording…
         </button>
       </div>
-    </Transition>
-    <Transition name="pop">
-      <BrushPopover
-        v-if="open === 'brush'"
-        :style="placement"
-        :tool="brushTool"
-        :settings="settings[brushTool]"
-        :color="color === 'ink' ? ink : color"
-        :shape="mode === 'shape'"
-        @change="changeSettings"
-        @reset="resetSettings"
-      />
-    </Transition>
-    <Transition name="pop">
-      <ColorPopover
-        v-if="open === 'palette'"
-        :style="placement"
+      <div v-if="open === 'paint'" class="popover pill menu" :style="placement" role="menu" aria-label="Painting tools">
+        <button
+          v-for="t in PAINT_TOOLS"
+          :key="t"
+          :id="'tool-' + t"
+          class="item"
+          @click="
+            setMode(t);
+            openFrom('brush-settings', 'brush');
+          "
+        >
+          <Icon :name="t" />{{ TOOL_INFO[t].name }}<kbd class="shortcut">{{ TOOL_INFO[t].key }}</kbd>
+        </button>
+      </div>
+      <Toolbar
+        :tool="isTool(effective) ? effective : null"
         :color="color"
         :ink="ink"
-        :recents="recents"
+        :brush-tool="brushTool"
+        :size="settings[brushTool].size"
+        :opacity="settings[brushTool].opacity"
+        :open="open"
+        @paint="(e) => toggle('paint', e)"
+        @tool="setMode"
         @color="chooseColor"
-        @eyedropper="sampleColour"
+        @brush="(e) => toggle('brush', e)"
+        @palette="(e) => toggle('palette', e)"
       />
-    </Transition>
-    <Transition name="pop">
-      <ShapePopover
-        v-if="open === 'shape'"
-        :style="placement"
-        :shape="shape"
-        :ink="inkTool"
-        @shape="(s) => ((shape = s), (open = null))"
+
+      <Navigator
+        v-if="navigatorOn && drawable"
+        :version="navigatorVersion"
+        :thumbnail="surface.thumbnail"
+        :viewport="surface.viewport"
+        :on-view="surface.onView"
+        @centre="surface.centreOn"
       />
-    </Transition>
-    <Transition name="pop">
-      <SymmetryPopover
-        v-if="open === 'symmetry'"
-        :style="placement"
-        :symmetry="symmetry"
-        :last="lastSymmetry"
-        @change="setSymmetry"
-        @centre="centreSymmetry"
+      <ViewControls
+        :view="viewState"
+        :navigator="navigatorOn"
+        :open="open === 'view'"
+        @zoom-in="surface.zoomBy(1.25)"
+        @zoom-out="surface.zoomBy(0.8)"
+        @menu="(e) => toggle('view', e)"
+        @navigator="navigatorOn = !navigatorOn"
       />
-    </Transition>
-    <Transition name="pop">
-      <div v-if="open === 'view'" class="popover pill menu view-menu" :style="placement" role="menu" aria-label="View">
-        <button id="zoom-actual" class="item" role="menuitem" @click="surface.zoomTo(1)">
-          <Icon name="page" :size="16" />Actual size<kbd class="shortcut">Ctrl+0</kbd>
-        </button>
-        <button id="zoom-fit" class="item" role="menuitem" @click="surface.fitContent()">
-          <Icon name="fit" :size="16" />Fit drawing<kbd class="shortcut">Shift+1</kbd>
-        </button>
-        <i class="rule" />
-        <p class="heading">Rotation</p>
-        <div class="rotation">
-          <button
-            id="rotate-left"
-            class="icon-button"
-            aria-label="Rotate left"
-            @click="surface.rotateBy(-15)"
-            @pointerenter="showTip($event, 'Rotate left  ,')"
-            @pointerleave="hideTip"
-          >
-            <Icon name="rotate-left" />
-          </button>
-          <span class="degrees">{{ angle }}°</span>
-          <button
-            id="rotate-right"
-            class="icon-button"
-            aria-label="Rotate right"
-            @click="surface.rotateBy(15)"
-            @pointerenter="showTip($event, 'Rotate right  .')"
-            @pointerleave="hideTip"
-          >
-            <Icon name="rotate-right" />
-          </button>
-          <button id="rotate-reset" class="text-button small" :disabled="!angle" @click="surface.resetRotation()">
-            <Icon name="compass" :size="16" />Reset
-          </button>
-        </div>
+    </template>
+    <template v-if="inPlayer">
+      <div
+        v-if="playCursor"
+        class="play-cursor"
+        :style="{
+          left: playCursor.x + 'px',
+          top: playCursor.y + 'px',
+          width: 2 * playCursor.r + 'px',
+          height: 2 * playCursor.r + 'px',
+          borderColor: playCursor.color,
+        }"
+      >
+        <span v-if="!cleanPlayer">{{ TOOL_INFO[playCursor.label as Tool]?.name }}</span>
       </div>
-    </Transition>
-
-    <p class="hint" :class="{ shown: hint }" aria-hidden="true">
-      Draw anywhere. Pinch or Ctrl+scroll to zoom. Press ? for shortcuts.
-    </p>
-
-    <Toolbar
-      :tool="isTool(effective) ? effective : null"
-      :color="color"
-      :ink="ink"
-      :brush-tool="brushTool"
-      :size="settings[brushTool].size"
-      :opacity="settings[brushTool].opacity"
-      :open="open"
-      @tool="setMode"
-      @color="chooseColor"
-      @brush="(e) => toggle('brush', e)"
-      @palette="(e) => toggle('palette', e)"
-    />
-
-    <Navigator
-      v-if="navigatorOn && drawable"
-      :version="navigatorVersion"
-      :thumbnail="surface.thumbnail"
-      :viewport="surface.viewport"
-      :on-view="surface.onView"
-      @centre="surface.centreOn"
-    />
-    <ViewControls
-      :view="viewState"
-      :navigator="navigatorOn"
-      :open="open === 'view'"
-      @zoom-in="surface.zoomBy(1.25)"
-      @zoom-out="surface.zoomBy(0.8)"
-      @menu="(e) => toggle('view', e)"
-      @navigator="navigatorOn = !navigatorOn"
-    />
-
+      <PlayerTransport v-if="!cleanPlayer" :player="player" />
+    </template>
     <p v-if="notice" class="notice pill" role="status">{{ notice }}</p>
 
     <ShortcutsSheet v-if="sheet" @close="sheet = false" />

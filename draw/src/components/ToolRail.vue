@@ -6,7 +6,7 @@ import Icon, { type IconName } from "./Icon.vue";
 const props = defineProps<{ mode: Mode; shape: Shape; symmetry: boolean; open: string | null }>();
 const emit = defineEmits<{ mode: [Mode]; flyout: ["shape" | "symmetry", Event] }>();
 
-const tools: { mode: Exclude<Mode, "pen" | "brush" | "marker" | "pencil" | "eraser">; icon: () => IconName }[] = [
+const tools: { mode: keyof typeof MODE_INFO; icon: () => IconName }[] = [
   { mode: "select", icon: () => "lasso" },
   { mode: "shape", icon: () => props.shape },
   { mode: "eyedropper", icon: () => "eyedropper" },
