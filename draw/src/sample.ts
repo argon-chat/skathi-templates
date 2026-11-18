@@ -1,5 +1,7 @@
 import type { Layer, Stroke, Tool } from "./model";
 
+import { canonicalPoint } from "./precision";
+
 type XY = [number, number];
 type Curve = [XY, XY, XY, XY];
 type Draft = Layer & { strokes: Stroke[] };
@@ -30,7 +32,7 @@ export function poppyStudy(nextSeq: () => number): Layer[] {
     const points: number[] = [];
     for (let i = 0; i <= count; i++) {
       const [x, y] = path(i / count);
-      points.push(x - cx, y - cy, pressure(i / count), 0, 0, 0, i * 4);
+      points.push(...canonicalPoint(x - cx, y - cy, pressure(i / count), 0, 0, 0, i * 4));
     }
     layer.strokes.push({ seq: nextSeq(), tool, color, width, points });
   }

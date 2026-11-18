@@ -1,5 +1,7 @@
 import { STRIDE, type Shape, type Stroke, type Symmetry } from "./model";
 
+import { coordinate16 } from "./precision";
+
 export interface Point {
   x: number;
   y: number;
@@ -53,17 +55,19 @@ export function transformStroke(stroke: Stroke, m: Affine, seq = stroke.seq): St
   const points = stroke.points.slice();
   for (let i = 0; i < points.length; i += STRIDE) {
     const p = apply(m, points[i]!, points[i + 1]!);
-    points[i] = p.x;
-    points[i + 1] = p.y;
+    points[i] = coordinate16(p.x);
+    points[i + 1] = coordinate16(p.y);
   }
   const width = stroke.width * Math.sqrt(Math.abs(m[0] * m[3] - m[1] * m[2]));
   const result: Stroke = { ...stroke, seq, points, width };
+  if (seq !== stroke.seq && stroke.seed === undefined && ["spray", "pencil", "airbrush"].includes(stroke.tool))
+    result.seed = stroke.seq;
   if (stroke.contours)
     result.contours = stroke.contours.map((ring) => {
       const out: number[] = [];
       for (let i = 0; i < ring.length; i += 2) {
         const p = apply(m, ring[i]!, ring[i + 1]!);
-        out.push(p.x, p.y);
+        out.push(coordinate16(p.x), coordinate16(p.y));
       }
       return out;
     });
