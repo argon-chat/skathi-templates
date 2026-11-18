@@ -1,4 +1,4 @@
-import type { DrawAction, DrawEvent, DrawMutation, DrawRecording, DrawSnapshot, DrawUi } from "./events";
+import type { DrawAction, DrawAtomic, DrawEvent, DrawRecording, DrawSnapshot, DrawUi } from "./events";
 import { clamp, STRIDE, type Layer, type Stroke } from "./model";
 import type { View } from "./renderer";
 
@@ -8,7 +8,8 @@ export interface PlayerFrame extends DrawSnapshot {
   cursor: { x: number; y: number; width: number; tool: Stroke["tool"]; color: string } | null;
 }
 
-type Mutation = DrawMutation | { kind: "restore-properties"; layer: Layer };
+type Atomic = DrawAtomic | { kind: "restore-properties"; layer: Layer };
+type Mutation = Atomic | { kind: "group"; changes: readonly Atomic[]; active?: string };
 type Change = Mutation | Extract<DrawAction, { kind: "ui" | "view" }>;
 type Step = { change: Change; command?: number; forward?: boolean };
 
@@ -33,6 +34,18 @@ class Drawing {
 
   apply(change: Change, inverse = false): Mutation | undefined {
     switch (change.kind) {
+      case "group": {
+        const active = this.active;
+        const reverse: Atomic[] = [];
+        for (const member of change.changes) {
+          const back = this.apply(member, inverse);
+          if (back && back.kind !== "group") reverse.push(back);
+        }
+        const target = change.active ?? active;
+        if (this.layers.some((l) => l.id === target)) this.active = target;
+        if (inverse) return { kind: "group", changes: reverse.reverse() };
+        break;
+      }
       case "ui":
         this.ui = { ...this.ui, ...change.state };
         if (change.state.active && this.layers.some((l) => l.id === change.state.active))

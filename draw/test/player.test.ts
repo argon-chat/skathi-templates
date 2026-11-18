@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import type { DrawEvent, DrawRecording } from "../src/events";
+import { decodeRecording, recordingHeader, metaChunk, snapshotChunk, eventsChunk, joinBytes } from "../src/events";
 import { type Layer, type Stroke } from "../src/model";
 import { PlaybackTimeline } from "../src/playbackTimeline";
 
@@ -20,6 +21,67 @@ function recording(events: DrawEvent[], initial?: Layer): DrawRecording {
 }
 
 const layer = "layer-1";
+
+test("a grouped layer merge encodes its delta and restores both layers in one undo step", async () => {
+  const base: Layer = { id: layer, name: "Base", strokes: [line(1)], opacity: 0.5, visible: true };
+  const upper: Layer = { ...base, id: "layer-2", name: "Upper", strokes: [line(2)] };
+  const untouched: Layer = {
+    ...base,
+    id: "layer-3",
+    name: "Paper",
+    strokes: Array.from({ length: 512 }, (_, i) => line(i + 10)),
+  };
+  const baked: Stroke = {
+    ...line(530),
+    tool: "bucket",
+    points: [0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],
+    patch: { x: 0, y: 0, width: 1, height: 1, rgba: "AAAA/w==" },
+  };
+  const initial = { active: upper.id, layers: [base, upper, untouched] };
+  const merge: DrawEvent = {
+    kind: "group",
+    active: base.id,
+    at: 10,
+    changes: [
+      { kind: "edit", layer: base.id, removed: [1], added: [baked] },
+      { kind: "layer", id: base.id, changes: { opacity: 1 } },
+      { kind: "delete-layer", id: upper.id },
+    ],
+  };
+  const events: DrawEvent[] = [merge, { kind: "undo", at: 20 }, { kind: "redo", at: 30 }];
+  const packed = await eventsChunk(events, 0);
+  const snapshot = await snapshotChunk(initial);
+  expect(packed.length).toBeLessThan(snapshot.length / 4);
+  const file = await decodeRecording(
+    joinBytes([recordingHeader(false), metaChunk(recording([]).meta), snapshot, packed]),
+  );
+  expect(file.events).toEqual(events);
+  const timeline = new PlaybackTimeline(file),
+    first = file.initial!.layers,
+    back = timeline.frame(20, true);
+  expect(back.layers).toEqual(first);
+  expect(back.active).toBe(base.id);
+  const final = timeline.frame(30, true);
+  expect(final.layers[0]).toEqual({ ...first[0], opacity: 1, strokes: [baked] });
+  expect(final.layers[1]).toBe(first[2]);
+  expect(timeline.frame(15, false).layers).toEqual(first);
+  expect(timeline.frame(35, false).layers).toEqual(final.layers);
+  const fallback: DrawEvent = {
+    kind: "undo",
+    at: 5,
+    fallback: {
+      kind: "group",
+      changes: [
+        { kind: "add-layer", index: 1, layer: first[1]! },
+        { kind: "layer", id: base.id, changes: { opacity: 0.5 } },
+        { kind: "edit", layer: base.id, removed: [530], added: first[0]!.strokes },
+      ],
+    },
+  };
+  const external = new PlaybackTimeline({ ...file, initial: final, events: [fallback, { kind: "redo", at: 15 }] });
+  expect(external.frame(5, true).layers).toEqual(first);
+  expect(external.final.layers).toEqual(final.layers);
+});
 
 test("stroke growth follows point time across intervening interface events", () => {
   const tape = new PlaybackTimeline(

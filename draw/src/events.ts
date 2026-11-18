@@ -42,7 +42,7 @@ export interface DrawUi {
   symmetry?: Symmetry | null;
 }
 
-export type DrawMutation =
+export type DrawAtomic =
   | { kind: "stroke"; layer: string; strokes: readonly Stroke[] }
   | { kind: "edit"; layer: string; removed: readonly number[]; added: readonly Stroke[] }
   | { kind: "add-layer"; layer: Layer; index: number }
@@ -51,6 +51,7 @@ export type DrawMutation =
   | { kind: "layer"; id: string; changes: Partial<Omit<Layer, "id" | "strokes">> }
   | { kind: "replace"; layers: readonly Layer[] }
   | { kind: "clear" };
+export type DrawMutation = DrawAtomic | { kind: "group"; changes: readonly DrawAtomic[]; active?: string };
 
 export type DrawAction =
   | DrawMutation
@@ -82,6 +83,7 @@ const kinds: DrawAction["kind"][] = [
   "redo",
   "ui",
   "view",
+  "group",
 ];
 const META = 1,
   SNAPSHOT = 2,
@@ -260,7 +262,7 @@ function ui(v: unknown): v is DrawUi {
         finite(v.symmetry.y)))
   );
 }
-function mutation(v: Record<string, unknown>): boolean {
+function atomic(v: Record<string, unknown>): boolean {
   switch (v.kind) {
     case "stroke":
       return string(v.layer) && strokes(v.strokes) && v.strokes.length > 0;
@@ -288,6 +290,14 @@ function mutation(v: Record<string, unknown>): boolean {
     default:
       return false;
   }
+}
+function mutation(v: Record<string, unknown>): boolean {
+  return v.kind === "group"
+    ? optional(v.active, string) &&
+        Array.isArray(v.changes) &&
+        v.changes.length > 0 &&
+        v.changes.every((m: unknown) => record(m) && atomic(m))
+    : atomic(v);
 }
 function action(v: unknown): v is DrawAction {
   if (!record(v)) return false;

@@ -1,10 +1,10 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import { appWindow } from "@skathi-native/runtime";
-import type { DrawMutation } from "./events";
+import type { DrawAtomic, DrawMutation } from "./events";
 import { BLEND_MODES, isColor, STRIDE, TOOLS, type Layer, type Stroke, type Tool } from "./model";
 
 type Properties = Partial<Pick<Layer, "visible" | "alphaLocked" | "clipping" | "blendMode">>;
-type Command =
+type AtomicCommand =
   | { kind: "edit"; layer: string; removed: readonly Stroke[]; added: readonly Stroke[] }
   | { kind: "add-layer"; layer: Layer; index: number }
   | { kind: "delete-layer"; layer: Layer; index: number }
@@ -13,6 +13,7 @@ type Command =
   | { kind: "layer-opacity"; id: string; from: number; to: number }
   | { kind: "properties"; id: string; from: Properties; to: Properties }
   | { kind: "replace" | "clear"; before: readonly Layer[]; after: readonly Layer[] };
+type Command = AtomicCommand | { kind: "group"; steps: readonly AtomicCommand[]; active: string };
 
 type Write =
   | { kind: "put"; layer: string; stroke: Stroke }
@@ -112,37 +113,46 @@ function bySeq(strokes: readonly Stroke[], removed: readonly Stroke[], added: re
 /** The drawing: its layers, undo history and an IndexedDB copy written a stroke at a time. */
 export function useSketchbook() {
   let emit: ((command: object, direction: "do" | "undo" | "redo", mutation: () => DrawMutation) => void) | undefined;
+  function atomic(c: AtomicCommand, forward: boolean, stroke: boolean): DrawAtomic {
+    switch (c.kind) {
+      case "edit": {
+        if (stroke && forward) return { kind: "stroke", layer: c.layer, strokes: c.added };
+        return {
+          kind: "edit",
+          layer: c.layer,
+          removed: (forward ? c.removed : c.added).map((s) => s.seq),
+          added: forward ? c.added : c.removed,
+        };
+      }
+      case "add-layer":
+      case "delete-layer":
+        return (c.kind === "add-layer") === forward
+          ? { kind: "add-layer", layer: c.layer, index: c.index }
+          : { kind: "delete-layer", id: c.layer.id };
+      case "move-layer":
+        return { kind: "move-layer", from: forward ? c.from : c.to, to: forward ? c.to : c.from };
+      case "rename-layer":
+        return { kind: "layer", id: c.id, changes: { name: forward ? c.to : c.from } };
+      case "layer-opacity":
+        return { kind: "layer", id: c.id, changes: { opacity: forward ? c.to : c.from } };
+      case "properties":
+        return { kind: "layer", id: c.id, changes: forward ? c.to : c.from };
+      case "clear":
+        return forward ? { kind: "clear" } : { kind: "replace", layers: c.before };
+      case "replace":
+        return { kind: "replace", layers: forward ? c.after : c.before };
+    }
+  }
   function publish(c: Command, direction: "do" | "undo" | "redo", stroke = false) {
     emit?.(c, direction, () => {
       const forward = direction !== "undo";
-      switch (c.kind) {
-        case "edit": {
-          if (stroke && forward) return { kind: "stroke", layer: c.layer, strokes: c.added };
-          return {
-            kind: "edit",
-            layer: c.layer,
-            removed: (forward ? c.removed : c.added).map((s) => s.seq),
-            added: forward ? c.added : c.removed,
-          };
-        }
-        case "add-layer":
-        case "delete-layer":
-          return (c.kind === "add-layer") === forward
-            ? { kind: "add-layer", layer: c.layer, index: c.index }
-            : { kind: "delete-layer", id: c.layer.id };
-        case "move-layer":
-          return { kind: "move-layer", from: forward ? c.from : c.to, to: forward ? c.to : c.from };
-        case "rename-layer":
-          return { kind: "layer", id: c.id, changes: { name: forward ? c.to : c.from } };
-        case "layer-opacity":
-          return { kind: "layer", id: c.id, changes: { opacity: forward ? c.to : c.from } };
-        case "properties":
-          return { kind: "layer", id: c.id, changes: forward ? c.to : c.from };
-        case "clear":
-          return forward ? { kind: "clear" } : { kind: "replace", layers: c.before };
-        case "replace":
-          return { kind: "replace", layers: forward ? c.after : c.before };
-      }
+      if (c.kind !== "group") return atomic(c, forward, stroke);
+      const steps = forward ? c.steps : [...c.steps].reverse();
+      return {
+        kind: "group",
+        changes: steps.map((step) => atomic(step, forward, false)),
+        ...(forward ? { active: c.active } : {}),
+      };
     });
   }
   const layers = shallowRef<readonly Layer[]>([blank(1)]);
@@ -227,6 +237,12 @@ export function useSketchbook() {
   }
 
   function apply(c: Command, forward: boolean) {
+    if (c.kind === "group") {
+      const target = forward ? c.active : active.value;
+      for (const step of forward ? c.steps : [...c.steps].reverse()) apply(step, forward);
+      selectLayer(target);
+      return;
+    }
     const list = [...layers.value];
     switch (c.kind) {
       case "edit": {
@@ -354,24 +370,50 @@ export function useSketchbook() {
    * Folds a layer into the one below it. Its strokes move over in order, above the lower layer's,
    * and keep their look: the layer's opacity is carried into each stroke.
    */
-  function mergeDown(id: string) {
+  function mergeDown(id: string, precomposited?: Layer) {
     const i = index(id);
     const upper = layers.value[i];
     const lower = layers.value[i - 1];
-    if (!upper || !lower) return;
-    const carried = upper.strokes.map((s) => ({
-      ...s,
-      seq: nextSeq(),
-      opacity: Math.min(1, (s.opacity ?? 1) * (upper.opacity / Math.max(lower.opacity, 1e-3))),
-    }));
-    const merged: Layer = {
-      ...lower,
-      visible: lower.visible || upper.visible,
-      strokes: [...lower.strokes, ...carried],
-    };
-    const after = layers.value.filter((l) => l !== upper).map((l) => (l === lower ? merged : l));
-    run({ kind: "replace", before: layers.value, after });
-    active.value = lower.id;
+    if (!upper || !lower || (precomposited && precomposited.id !== lower.id)) return;
+    const carried =
+      precomposited?.strokes ??
+      upper.strokes.map((s) => ({
+        ...s,
+        seq: nextSeq(),
+        opacity: Math.min(1, (s.opacity ?? 1) * (upper.opacity / Math.max(lower.opacity, 1e-3))),
+      }));
+    const steps: AtomicCommand[] = [];
+    let added: readonly Stroke[] = carried,
+      removed: readonly Stroke[] = [];
+    if (precomposited) {
+      const before = new Set(lower.strokes),
+        after = new Set(carried);
+      added = carried.filter((s) => !before.has(s));
+      removed = lower.strokes.filter((s) => !after.has(s));
+      for (const s of added) seq = Math.max(seq, s.seq + 1);
+    }
+    if (added.length || removed.length) steps.push({ kind: "edit", layer: lower.id, removed, added });
+    const properties = (l: Layer): Required<Properties> => ({
+      visible: l.visible,
+      alphaLocked: l.alphaLocked ?? false,
+      clipping: l.clipping ?? false,
+      blendMode: l.blendMode ?? "normal",
+    });
+    const from = properties(lower),
+      to = precomposited ? properties(precomposited) : { ...from, visible: lower.visible || upper.visible };
+    if (
+      from.visible !== to.visible ||
+      from.alphaLocked !== to.alphaLocked ||
+      from.clipping !== to.clipping ||
+      from.blendMode !== to.blendMode
+    )
+      steps.push({ kind: "properties", id: lower.id, from, to });
+    if (precomposited && precomposited.opacity !== lower.opacity)
+      steps.push({ kind: "layer-opacity", id: lower.id, from: lower.opacity, to: precomposited.opacity });
+    if (precomposited && precomposited.name !== lower.name)
+      steps.push({ kind: "rename-layer", id: lower.id, from: lower.name, to: precomposited.name });
+    steps.push({ kind: "delete-layer", layer: upper, index: i });
+    run({ kind: "group", steps, active: lower.id });
   }
 
   function deleteLayer(id: string) {
