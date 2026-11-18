@@ -1,7 +1,6 @@
 <script setup lang="ts">
-import type { NIBS } from "../model";
+import type { Tool } from "../model";
 
-type Tool = (typeof NIBS)[number];
 const props = defineProps<{ tool: Tool; tip: string; band: string | null }>();
 const bands: Record<Tool, [number, number]> = {
   pen: [2.5, 23],
@@ -9,6 +8,11 @@ const bands: Record<Tool, [number, number]> = {
   marker: [2, 24],
   pencil: [3, 22],
   eraser: [3, 22],
+  spray: [4, 20],
+  airbrush: [8, 12],
+  bucket: [3, 22],
+  "lasso-fill": [10, 8],
+  smudge: [5, 18],
 };
 const bandBox = () => bands[props.tool];
 </script>
@@ -54,6 +58,45 @@ const bandBox = () => bands[props.tool];
       <path d="M14 0.8 L17.4 10 H10.6 Z" :fill="tip" />
       <path d="M3 27 Q6.7 24.4 10.3 27 Q14 24.4 17.7 27 Q21.3 24.4 25 27 V72 H3 Z" :fill="`url(#body-${tool})`" />
       <path d="M10.3 27 V72 M17.7 27 V72" stroke="#00000012" stroke-width="0.9" />
+    </template>
+    <template v-else-if="tool === 'spray'">
+      <rect x="11" y="1" width="6" height="5" rx="1" fill="#E9E9EC" />
+      <circle cx="11.6" cy="3.4" r="0.9" fill="#00000059" />
+      <path d="M6 20 Q6 7 14 6.5 Q22 7 22 20 Z" :fill="tip" />
+      <path d="M9.5 16 Q9.8 10.5 13.5 9.2" stroke="#ffffff59" stroke-width="1.1" fill="none" stroke-linecap="round" />
+      <path d="M5 20 H23 L24 26 H4 Z" :fill="`url(#metal-${tool})`" />
+      <rect x="4" y="26" width="20" height="46" rx="2" :fill="`url(#body-${tool})`" />
+      <rect x="4" y="26" width="20" height="1.4" fill="#00000017" />
+    </template>
+    <template v-else-if="tool === 'airbrush'">
+      <path d="M14 0.5 L15.4 9 H12.6 Z" fill="#9A9AA1" />
+      <path d="M12.6 9 H15.4 L19 19 H9 Z" :fill="`url(#metal-${tool})`" />
+      <path d="M17 13 Q17 10.4 21.5 10.4 Q26 10.4 26 13 L25 20 Q24.6 22 21.5 22 Q18.4 22 18 20 Z" :fill="`url(#metal-${tool})`" />
+      <ellipse cx="21.5" cy="12" rx="3.6" ry="1.4" :fill="tip" />
+      <rect x="8" y="19" width="12" height="53" rx="2" :fill="`url(#body-${tool})`" />
+      <rect x="11.5" y="23" width="5" height="3.5" rx="1.2" fill="#8E8E95" />
+    </template>
+    <template v-else-if="tool === 'bucket'">
+      <path d="M4 25 Q4 3 14 3 Q24 3 24 25" stroke="#8E8E95" stroke-width="1.4" fill="none" />
+      <ellipse cx="14" cy="25" rx="12" ry="3.4" :fill="`url(#metal-${tool})`" />
+      <ellipse cx="14" cy="25" rx="10.4" ry="2.4" :fill="tip" />
+      <rect x="2" y="25" width="24" height="47" rx="1.5" :fill="`url(#body-${tool})`" />
+      <path d="M5 26.5 V33 Q5 35 6.5 35 Q8 35 8 33 V27.4 Z" :fill="tip" />
+      <path d="M2 25 Q14 30.2 26 25" stroke="#00000022" stroke-width="0.8" fill="none" />
+    </template>
+    <template v-else-if="tool === 'lasso-fill'">
+      <rect x="2.5" y="3" width="23" height="13" rx="4" :fill="tip" />
+      <path d="M6 6.5 H22" stroke="#ffffff40" stroke-width="1.2" stroke-linecap="round" />
+      <path d="M25.5 9.5 H27 V20 H14 V27" stroke="#9A9AA1" stroke-width="1.6" fill="none" stroke-linejoin="round" />
+      <rect x="10" y="27" width="8" height="45" rx="2.5" :fill="`url(#body-${tool})`" />
+    </template>
+    <template v-else-if="tool === 'smudge'">
+      <path d="M14 1 L24 26 H4 Z" fill="#E7E1D6" />
+      <path d="M14 1 L18.2 11.5 H9.8 Z" fill="#8C8A90" />
+      <path d="M9.8 11.5 H18.2 L19.6 15 H8.4 Z" fill="#8C8A90" opacity="0.45" />
+      <path d="M7.5 18.5 L20.5 15.5 M5.6 23.4 L22.8 19.4" stroke="#00000018" stroke-width="0.8" />
+      <rect x="4" y="26" width="20" height="46" fill="#EDE8DE" />
+      <path d="M4 34 L24 30 M4 46 L24 42 M4 58 L24 54" stroke="#00000014" stroke-width="0.8" />
     </template>
     <template v-else>
       <path d="M3 19 Q3 6 14 6 Q25 6 25 19 V24 H3 Z" fill="#DDB8BF" />

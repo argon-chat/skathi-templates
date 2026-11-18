@@ -57,6 +57,25 @@ const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : Strin
         <ToolGlyph :tool="t" :tip="t === 'eraser' ? '#D8B9BF' : hex(color)" :band="t === tool ? hex(color) : null" />
       </button>
     </div>
+    <div class="tools paint-items" role="radiogroup" aria-label="Painting tool">
+      <button
+        v-for="t in PAINT_TOOLS"
+        :key="t"
+        :id="`tool-${t}`"
+        class="tool"
+        :class="{ selected: t === tool }"
+        role="radio"
+        :aria-checked="t === tool"
+        :aria-label="TOOL_INFO[t].name"
+        @click="emit('tool', t)"
+        @pointerenter="showTip($event, `${TOOL_INFO[t].name}  ${TOOL_INFO[t].key}`)"
+        @focus="showTip($event, `${TOOL_INFO[t].name}  ${TOOL_INFO[t].key}`)"
+        @pointerleave="hideTip"
+        @blur="hideTip"
+      >
+        <ToolGlyph :tool="t" :tip="hex(color)" :band="t === tool && t !== 'smudge' ? hex(color) : null" />
+      </button>
+    </div>
     <span class="anchor paint-anchor">
       <button
         id="paint-tools"
@@ -179,6 +198,20 @@ const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : Strin
 }
 .tool.selected {
   transform: translateY(11px);
+}
+.paint-items {
+  margin-left: -4px;
+}
+.anchor.paint-anchor {
+  display: none;
+}
+@media (max-width: 760px) {
+  .paint-items {
+    display: none;
+  }
+  .anchor.paint-anchor {
+    display: flex;
+  }
 }
 .tool:focus-visible {
   outline: 2px solid #ffffffd0;
