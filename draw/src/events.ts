@@ -205,7 +205,11 @@ function survivingChunk(bytes: Uint8Array, start: number) {
   }
   return false;
 }
-export async function decodeRecording(bytes: Uint8Array, table = new LayerTable()): Promise<DrawRecording> {
+export async function decodeRecording(
+  bytes: Uint8Array,
+  table = new LayerTable(),
+  { requireComplete = false } = {},
+): Promise<DrawRecording> {
   if (bytes.length > LIMITS.file) bad("file too large");
   const r = new Reader(bytes),
     header = readHeader(r),
@@ -266,6 +270,7 @@ export async function decodeRecording(bytes: Uint8Array, table = new LayerTable(
     }
   }
   if (!meta) return bad("missing canvas metadata");
+  if (requireComplete && (!ended || r.left)) throw new Error("Part of the recording is missing or damaged.");
   return {
     meta,
     initial,

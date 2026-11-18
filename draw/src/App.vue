@@ -139,6 +139,18 @@ const {
 } = session;
 const { loaded: inPlayer, hideUi: cleanPlayer } = player;
 const recordingControlsBusy = computed(() => documentBusy.value || drawing.value || session.busy.value);
+const newRecording = ref(false);
+const draftTitle = ref("");
+const draftAuthor = ref("");
+const recordingForm = computed(() => recordState.value === "idle" || newRecording.value);
+function editNewRecording() {
+  draftTitle.value = "";
+  draftAuthor.value = recordAuthor.value;
+  newRecording.value = true;
+}
+watch(open, (value) => {
+  if (value !== "recording") newRecording.value = false;
+});
 Object.assign(window, { __draw: { open: session.open, play: player.play, seek: player.seek, pause: player.pause } });
 const hint = computed(() => ready.value && !error.value && strokeCount.value === 0 && !drawing.value);
 const lastStroke = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
@@ -955,29 +967,45 @@ onBeforeUnmount(() => {
         role="dialog"
         aria-label="Recording"
       >
-        <p class="heading">Recording</p>
+        <p class="heading">
+          {{ recordingForm ? "New recording" : recordState === "stopped" ? "Recording stopped" : "Recording" }}
+        </p>
         <template v-if="recordState === 'error'">
           <small role="alert">{{ session.error.value }}</small>
           <button id="record-retry" class="item" :disabled="session.busy.value" @click="session.retry">
             Retry recording
           </button>
         </template>
-        <template v-else-if="!session.active.value">
+        <template v-else-if="recordingForm">
           <input
-            v-model="recordTitle"
+            v-model="draftTitle"
             aria-label="Recording title"
             placeholder="Title (optional)"
             class="record-field"
           />
-          <input v-model="recordAuthor" aria-label="Artist name" placeholder="Artist (optional)" class="record-field" />
-          <button id="record-start" class="item" :disabled="recordingControlsBusy" @click="session.start">
-            <Icon name="record" :size="16" />{{
-              recordState === "stopped" ? "Start a new recording" : "Start recording"
-            }}
+          <input v-model="draftAuthor" aria-label="Artist name" placeholder="Artist (optional)" class="record-field" />
+          <small v-if="newRecording"
+            >Starting will replace the recording kept in Draw. Save a copy first if you want to keep it.</small
+          >
+          <button
+            id="record-start"
+            class="item"
+            :disabled="recordingControlsBusy"
+            @click="session.start({ title: draftTitle, author: draftAuthor })"
+          >
+            <Icon name="record" :size="16" />Start recording
           </button>
-          <small v-if="recordState === 'stopped'">Starting again replaces the recording saved in Draw.</small>
+          <button
+            v-if="newRecording"
+            id="record-cancel-new"
+            class="item"
+            :disabled="recordingControlsBusy"
+            @click="newRecording = false"
+          >
+            Cancel
+          </button>
         </template>
-        <template v-else>
+        <template v-else-if="session.active.value">
           <button
             v-if="recordState === 'recording'"
             id="record-pause"
@@ -994,43 +1022,70 @@ onBeforeUnmount(() => {
             Stop recording
           </button>
         </template>
-        <i class="rule" />
-        <button
-          id="record-protect"
-          class="item"
-          role="checkbox"
-          :aria-checked="protectRecording"
-          @click="protectRecording = !protectRecording"
-        >
-          <Icon :name="protectRecording ? 'check' : 'rect'" :size="15" />Protect recording
-        </button>
-        <small>View-only flag. The file is unencrypted.</small>
-        <i class="rule" />
-        <button
-          id="record-save"
-          class="item"
-          :disabled="recordState === 'idle' || recordingControlsBusy"
-          @click="session.save"
-        >
-          Save recording…
-        </button>
-        <button
-          v-if="recordState === 'stopped'"
-          id="record-preview"
-          class="item"
-          :disabled="recordingControlsBusy"
-          @click="session.preview"
-        >
-          Play this recording
-        </button>
-        <button
-          id="record-open"
-          class="item"
-          :disabled="session.active.value || session.busy.value"
-          @click="session.choose"
-        >
-          Open recording…
-        </button>
+        <template v-else>
+          <div class="record-summary">
+            <strong>{{ recordTitle || "Untitled recording" }}</strong
+            ><span>{{ stamp }}</span>
+          </div>
+        </template>
+        <template v-if="!recordingForm && recordState !== 'error'">
+          <button
+            id="record-save"
+            :class="recordState === 'stopped' ? 'primary' : 'item'"
+            :disabled="recordingControlsBusy"
+            @click="session.save"
+          >
+            <Icon name="export" :size="15" />{{
+              session.saving.value
+                ? "Preparing file…"
+                : session.saveError.value
+                  ? "Try saving again…"
+                  : "Save recording…"
+            }}
+          </button>
+          <small v-if="session.saveError.value" id="record-save-error" role="alert">{{
+            session.saveError.value
+          }}</small>
+          <small v-else-if="session.saveStatus.value" role="status">{{ session.saveStatus.value }}</small>
+          <button
+            v-if="recordState === 'stopped'"
+            id="record-preview"
+            class="item"
+            :disabled="recordingControlsBusy"
+            @click="session.preview"
+          >
+            Play this recording
+          </button>
+        </template>
+        <template v-if="recordState !== 'error' && !newRecording">
+          <i class="rule" />
+          <button
+            id="record-protect"
+            class="item"
+            role="checkbox"
+            :aria-checked="protectRecording"
+            :disabled="recordingControlsBusy"
+            @click="protectRecording = !protectRecording"
+          >
+            <Icon :name="protectRecording ? 'check' : 'rect'" :size="15" />Protect recording
+          </button>
+          <small>View-only flag. The file is unencrypted.</small>
+          <template v-if="!session.active.value">
+            <i class="rule" />
+            <button
+              v-if="recordState === 'stopped'"
+              id="record-new"
+              class="item"
+              :disabled="recordingControlsBusy"
+              @click="editNewRecording"
+            >
+              New recording…
+            </button>
+            <button id="record-open" class="item" :disabled="recordingControlsBusy" @click="session.choose">
+              Open recording…
+            </button>
+          </template>
+        </template>
       </div>
       <div v-if="open === 'paint'" class="popover pill menu" :style="placement" role="menu" aria-label="Painting tools">
         <button

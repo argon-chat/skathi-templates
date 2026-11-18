@@ -494,6 +494,31 @@ kbd.shortcut {
   margin: 3px 9px 8px;
   white-space: normal;
 }
+.record-summary {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 3px 10px 10px;
+}
+.record-summary strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.record-summary span {
+  color: #c4c4ca;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.recording-panel .primary {
+  flex: none;
+  margin: 0 4px 4px;
+}
+.recording-panel small[role="alert"] {
+  color: #ffb5ad;
+}
 .record-field {
   height: 28px;
   width: calc(100% - 12px);

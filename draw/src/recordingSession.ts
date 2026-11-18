@@ -35,6 +35,9 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
     author = ref("");
   const active = computed(() => state.value === "paused" || state.value === "recording" || state.value === "error");
   const error = ref("");
+  const saving = ref(false),
+    saveError = ref(""),
+    saveStatus = ref("");
   const stamp = computed(() => {
     const sec = Math.floor(elapsed.value / 1000);
     return Math.floor(sec / 60) + ":" + String(sec % 60).padStart(2, "0");
@@ -186,7 +189,7 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
       busy.value = false;
     }
   }
-  const start = () =>
+  const start = (metadata = { title: title.value, author: author.value }) =>
     task(async () => {
       const { layers, active } = book;
       const first = layers.value[0];
@@ -210,13 +213,17 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
           paper: ui.value.paper ?? "plain",
           dark: ui.value.dark ?? false,
           seed: 1,
-          ...(title.value && { title: title.value }),
-          ...(author.value && { author: author.value }),
+          ...(metadata.title && { title: metadata.title }),
+          ...(metadata.author && { author: metadata.author }),
         },
         empty ? null : { layers: layers.value, active: active.value },
         protect.value,
         book.revision(),
       );
+      title.value = metadata.title;
+      author.value = metadata.author;
+      saveStatus.value = "";
+      saveError.value = "";
       publishUi(ui.value);
       dismiss();
     });
@@ -265,34 +272,34 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
     });
   const save = () =>
     task(async () => {
-      const filename = (title.value.trim() || "Drawing") + ".skev";
-      const target =
-        typeof showSaveFilePicker === "function"
-          ? await showSaveFilePicker({ id: "draw-events", suggestedName: filename, types })
-          : null;
-      const data = await rec.bytes(protect.value);
-      new PlaybackTimeline(await decodeRecording(data));
-      const blob = new Blob([data], { type: RECORDING_MIME });
-      if (target) {
-        const writer = await target.createWritable();
+      saveError.value = "";
+      saveStatus.value = "";
+      saving.value = true;
+      try {
+        if (pendingView !== undefined) emitView();
+        const data = await rec.bytes(protect.value);
+        await decodeRecording(data, undefined, { requireComplete: true });
+        const filename = (title.value.trim() || "Drawing") + ".skev";
+        const blob = new Blob([data], { type: RECORDING_MIME });
+        // Skathi's save picker truncates the selected file on return. A download stages the
+        // complete blob in a sibling file and replaces the destination only after writing it.
+        const link = document.createElement("a");
+        const url = URL.createObjectURL(blob);
         try {
-          await writer.write(blob);
-          await writer.close();
-        } catch (e) {
-          await writer.abort().catch(() => {});
-          throw e;
+          link.setAttribute("href", url);
+          link.setAttribute("download", filename);
+          document.body.appendChild(link);
+          link.click();
+        } finally {
+          link.remove();
+          URL.revokeObjectURL(url);
         }
-      } else {
-        const a = document.createElement("a"),
-          url = URL.createObjectURL(blob);
-        a.setAttribute("href", url);
-        a.setAttribute("download", filename);
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 30000);
+        saveStatus.value = "Prepared " + filename + " for export.";
+      } catch (e) {
+        saveError.value = e instanceof Error ? e.message : "Could not prepare the recording for export.";
+      } finally {
+        saving.value = false;
       }
-      notify("Saved " + (target?.name ?? filename));
     });
   const preview = () =>
     task(async () => {
@@ -431,6 +438,9 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
   return {
     state,
     error,
+    saving,
+    saveError,
+    saveStatus,
     retry,
     stamp,
     ready,
