@@ -215,13 +215,13 @@ export function useSurface(o: Options) {
   const home = () => setView({ zoom: 1, angle: 0, x: size.w / 2, y: size.h / 2 });
 
   /** Fits the drawing between the title strip and the toolbar, at 100% at most, keeping the rotation. */
-  function fitContent(layers: readonly Layer[] = book.layers.value) {
+  function fitContent(layers: readonly Layer[] = book.layers.value, rotation = view.angle) {
     const b = contentBounds(layers);
     if (!b) return home();
     const top = 56;
     const bottom = 112;
-    const c = Math.cos(view.angle);
-    const s = Math.sin(view.angle);
+    const c = Math.cos(rotation);
+    const s = Math.sin(rotation);
     const xs: number[] = [];
     const ys: number[] = [];
     for (const [x, y] of [
@@ -237,7 +237,7 @@ export function useSurface(o: Options) {
     const h = Math.max(...ys) - Math.min(...ys);
     const z = Math.max(MIN_ZOOM, Math.min(1, (size.w - 96) / w, (size.h - top - bottom) / h));
     const mid = { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
-    setView(placed(mid, { x: size.w / 2, y: top + (size.h - top - bottom) / 2 }, z, view.angle));
+    setView(placed(mid, { x: size.w / 2, y: top + (size.h - top - bottom) / 2 }, z, rotation));
   }
 
   function centreOn(x: number, y: number) {

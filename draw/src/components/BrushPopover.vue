@@ -186,6 +186,8 @@ const percent = (v: number) => `${Math.round(v * 100)}%`;
 <style scoped>
 .brush-panel {
   width: 272px;
+  max-height: calc(100vh - 124px);
+  overflow-y: auto;
   padding: 10px;
   display: flex;
   flex-direction: column;

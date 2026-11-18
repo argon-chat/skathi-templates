@@ -287,6 +287,18 @@ const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : Strin
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
 }
+@media (max-width: 560px) {
+  .toolbar {
+    padding: 0 8px;
+    gap: 7px;
+  }
+  .tools {
+    gap: 4px;
+  }
+  .colors {
+    gap: 6px;
+  }
+}
 @media (prefers-reduced-motion: reduce) {
   .tool,
   .swatch,

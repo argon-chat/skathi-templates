@@ -74,35 +74,58 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
   watch(ui, (state) => {
     if (!recovering && rec.state === "recording" && !originalView) rec.record({ kind: "ui", state });
   });
+  let authorWidth = 1,
+    authorHeight = 1;
+  function resized() {
+    requestAnimationFrame(() => {
+      if (shown.value) present(shown.value);
+    });
+  }
+  function present(frame: PlayerFrame) {
+    shown.value = frame;
+    surface.present(frame.layers, frame.ui.dark ?? false, frame.ui.paper ?? "plain");
+    const key =
+      player.camera.value === "fit"
+        ? [player.finalLayers.value, innerWidth, innerHeight]
+        : [frame.view.x, frame.view.y, frame.view.angle, frame.view.zoom, innerWidth, innerHeight];
+    if (key.length !== cameraKey.length || key.some((v, i) => v !== cameraKey[i])) {
+      cameraKey = key;
+      if (player.camera.value === "fit") surface.fitContent(player.finalLayers.value, 0);
+      else {
+        const scale = Math.min(innerWidth / authorWidth, innerHeight / authorHeight);
+        surface.setView({
+          angle: frame.view.angle,
+          zoom: frame.view.zoom * scale,
+          x: frame.view.x * scale + (innerWidth - authorWidth * scale) / 2,
+          y: frame.view.y * scale + (innerHeight - authorHeight * scale) / 2,
+        });
+      }
+    }
+    const p = frame.cursor;
+    cursor.value = p
+      ? {
+          ...surface.toScreen(p.x, p.y),
+          r: Math.max(3, (p.width * surface.zoom.value) / 2),
+          label: p.tool,
+          color: p.color === "ink" ? (frame.ui.dark ? "#f2f2f4" : "#1c1c1e") : p.color,
+        }
+      : null;
+  }
   const player = createPlayer({
-    prepare: surface.preparePlayback,
+    async prepare(file, isCurrent) {
+      await surface.preparePlayback(file, isCurrent);
+      if (isCurrent()) {
+        authorWidth = file.meta.width;
+        authorHeight = file.meta.height;
+        cameraKey = [];
+      }
+    },
     enter() {
       originalView = surface.getView();
       dismiss();
       surface.beginPlayback();
     },
-    present(frame) {
-      shown.value = frame;
-      surface.present(frame.layers, frame.ui.dark ?? false, frame.ui.paper ?? "plain");
-      const key =
-        player.camera.value === "fit"
-          ? [player.finalLayers.value, innerWidth, innerHeight]
-          : [frame.view.x, frame.view.y, frame.view.angle, frame.view.zoom];
-      if (key.length !== cameraKey.length || key.some((v, i) => v !== cameraKey[i])) {
-        cameraKey = key;
-        if (player.camera.value === "fit") surface.fitContent(player.finalLayers.value);
-        else surface.setView(frame.view);
-      }
-      const p = frame.cursor;
-      cursor.value = p
-        ? {
-            ...surface.toScreen(p.x, p.y),
-            r: Math.max(3, (p.width * surface.zoom.value) / 2),
-            label: p.tool,
-            color: p.color === "ink" ? (frame.ui.dark ? "#f2f2f4" : "#1c1c1e") : p.color,
-          }
-        : null;
-    },
+    present,
     close(keep, frame) {
       shown.value = null;
       cursor.value = null;
@@ -256,6 +279,7 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
     }
   });
   onMounted(async () => {
+    addEventListener("resize", resized);
     try {
       await rec.recover();
       protect.value = rec.protected;
@@ -300,6 +324,7 @@ export function useRecordingSession({ book, surface, ui, notify, dismiss, restor
     }
   });
   onBeforeUnmount(() => {
+    removeEventListener("resize", resized);
     off();
     clearInterval(clock);
     clearTimeout(pendingView);
