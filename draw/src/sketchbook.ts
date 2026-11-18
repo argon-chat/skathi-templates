@@ -3,11 +3,12 @@ import { appWindow } from "@skathi-native/runtime";
 import { isColor, STRIDE, TOOLS, type Layer, type Stroke, type Tool } from "./model";
 
 type Command =
-  | { kind: "stroke"; layer: string; stroke: Stroke }
+  | { kind: "edit"; layer: string; removed: readonly Stroke[]; added: readonly Stroke[] }
   | { kind: "add-layer"; layer: Layer; index: number }
   | { kind: "delete-layer"; layer: Layer; index: number }
   | { kind: "move-layer"; from: number; to: number }
   | { kind: "rename-layer"; id: string; from: string; to: string }
+  | { kind: "layer-opacity"; id: string; from: number; to: number }
   | { kind: "replace"; before: readonly Layer[]; after: readonly Layer[] };
 
 type Write =
@@ -22,7 +23,7 @@ interface StrokeRecord extends Stroke {
 
 interface DocumentRecord {
   version: 1;
-  layers: { id: string; name: string; visible: boolean }[];
+  layers: { id: string; name: string; visible: boolean; opacity?: number }[];
   active: string;
   seq: number;
 }
@@ -33,6 +34,8 @@ function record(v: unknown): v is Record<string, unknown> {
   return v !== null && typeof v === "object";
 }
 
+const unit = (v: unknown) => v === undefined || (typeof v === "number" && v >= 0 && v <= 1);
+
 function strokeRecord(v: unknown): v is StrokeRecord {
   return (
     record(v) &&
@@ -42,6 +45,8 @@ function strokeRecord(v: unknown): v is StrokeRecord {
     isColor(v.color) &&
     typeof v.width === "number" &&
     v.width > 0 &&
+    unit(v.opacity) &&
+    (v.shape === undefined || typeof v.shape === "boolean") &&
     Array.isArray(v.points) &&
     v.points.length > 0 &&
     v.points.length % STRIDE === 0 &&
@@ -59,7 +64,11 @@ function documentRecord(v: unknown): v is DocumentRecord {
     v.layers.length > 0 &&
     v.layers.every(
       (l: unknown) =>
-        record(l) && typeof l.id === "string" && typeof l.name === "string" && typeof l.visible === "boolean",
+        record(l) &&
+        typeof l.id === "string" &&
+        typeof l.name === "string" &&
+        typeof l.visible === "boolean" &&
+        unit(l.opacity),
     )
   );
 }
@@ -71,15 +80,27 @@ const request = <T>(r: IDBRequest<T>) =>
   });
 
 function openBook(): Promise<IDBDatabase> {
-  const open = indexedDB.open("skathi-draw-ink", 1);
-  open.onupgradeneeded = () => {
-    open.result.createObjectStore("strokes");
-    open.result.createObjectStore("document");
+  const open = indexedDB.open("skathi-draw-ink", 2);
+  open.onupgradeneeded = (e) => {
+    const db = open.result;
+    if (e.oldVersion < 1) {
+      db.createObjectStore("strokes");
+      db.createObjectStore("document");
+    }
+    if (e.oldVersion < 2) db.createObjectStore("prefs");
   };
   return request(open);
 }
 
-const blank = (n: number): Layer => ({ id: `layer-${n}`, name: `Layer ${n}`, visible: true, strokes: [] });
+const blank = (n: number): Layer => ({ id: `layer-${n}`, name: `Layer ${n}`, visible: true, opacity: 1, strokes: [] });
+
+function bySeq(strokes: readonly Stroke[], removed: readonly Stroke[], added: readonly Stroke[]): Stroke[] {
+  const gone = new Set(removed);
+  const kept = gone.size ? strokes.filter((s) => !gone.has(s)) : [...strokes];
+  const top = kept.at(-1)?.seq ?? -Infinity;
+  if (added.every((s) => s.seq > top)) return kept.concat([...added].sort((a, b) => a.seq - b.seq));
+  return kept.concat(added).sort((a, b) => a.seq - b.seq);
+}
 
 /** The drawing: its layers, undo history and an IndexedDB copy written a stroke at a time. */
 export function useSketchbook() {
@@ -99,6 +120,9 @@ export function useSketchbook() {
   let pending: Promise<boolean> | undefined;
   let closed = false;
   let closeAfterFailedRetry = false;
+  let prefsTimer: ReturnType<typeof setTimeout> | undefined;
+  let prefsValue: unknown;
+  let loadedPrefs: unknown;
 
   const index = (id: string) => layers.value.findIndex((l) => l.id === id);
   const activeLayer = () => layers.value.find((l) => l.id === active.value);
@@ -118,7 +142,7 @@ export function useSketchbook() {
     const batch = writes;
     const doc: DocumentRecord = {
       version: 1,
-      layers: layers.value.map(({ id, name, visible }) => ({ id, name, visible })),
+      layers: layers.value.map(({ id, name, visible, opacity }) => ({ id, name, visible, opacity })),
       active: active.value,
       seq,
     };
@@ -159,19 +183,14 @@ export function useSketchbook() {
   function apply(c: Command, forward: boolean) {
     const list = [...layers.value];
     switch (c.kind) {
-      case "stroke": {
+      case "edit": {
         const i = index(c.layer);
         const layer = list[i];
         if (!layer) return;
-        list[i] = {
-          ...layer,
-          strokes: forward ? [...layer.strokes, c.stroke] : layer.strokes.filter((s) => s !== c.stroke),
-        };
-        persist(
-          forward
-            ? { kind: "put", layer: c.layer, stroke: c.stroke }
-            : { kind: "delete", layer: c.layer, seq: c.stroke.seq },
-        );
+        const [removed, added] = forward ? [c.removed, c.added] : [c.added, c.removed];
+        list[i] = { ...layer, strokes: bySeq(layer.strokes, removed, added) };
+        for (const s of removed) persist({ kind: "delete", layer: c.layer, seq: s.seq });
+        for (const stroke of added) persist({ kind: "put", layer: c.layer, stroke });
         break;
       }
       case "add-layer":
@@ -195,10 +214,12 @@ export function useSketchbook() {
         persist();
         break;
       }
-      case "rename-layer": {
+      case "rename-layer":
+      case "layer-opacity": {
         const i = index(c.id);
         const layer = list[i];
-        if (layer) list[i] = { ...layer, name: forward ? c.to : c.from };
+        if (layer && c.kind === "rename-layer") list[i] = { ...layer, name: forward ? c.to : c.from };
+        if (layer && c.kind === "layer-opacity") list[i] = { ...layer, opacity: forward ? c.to : c.from };
         persist();
         break;
       }
@@ -206,8 +227,9 @@ export function useSketchbook() {
         const next = forward ? c.after : c.before;
         persist({ kind: "wipe" });
         for (const layer of next) for (const stroke of layer.strokes) persist({ kind: "put", layer: layer.id, stroke });
+        const keep = next.some((l) => l.id === active.value);
         setLayers(next);
-        active.value = next.at(-1)?.id ?? "";
+        if (!keep) active.value = next.at(-1)?.id ?? "";
         return;
       }
     }
@@ -241,15 +263,59 @@ export function useSketchbook() {
   /** A stroke number, unique in this drawing and above every earlier one. */
   const nextSeq = () => seq++;
 
-  function addStroke(stroke: Stroke) {
+  /** Adds strokes to the active layer as one step: a stroke, or a stroke and its mirrored copies. */
+  function addStrokes(strokes: readonly Stroke[]) {
     const layer = activeLayer();
-    if (layer?.visible) run({ kind: "stroke", layer: layer.id, stroke });
+    if (layer?.visible && strokes.length) run({ kind: "edit", layer: layer.id, removed: [], added: strokes });
+  }
+
+  /** Replaces `removed` with `added` in one layer, as one step. */
+  function edit(layer: string, removed: readonly Stroke[], added: readonly Stroke[]) {
+    if (index(layer) >= 0 && (removed.length || added.length)) run({ kind: "edit", layer, removed, added });
   }
 
   function addLayer() {
     let n = layers.value.length + 1;
     while (layers.value.some((l) => l.id === `layer-${n}`)) n++;
     run({ kind: "add-layer", layer: blank(n), index: index(active.value) + 1 });
+  }
+
+  function duplicateLayer(id: string) {
+    const i = index(id);
+    const layer = layers.value[i];
+    if (!layer) return;
+    let n = layers.value.length + 1;
+    while (layers.value.some((l) => l.id === `layer-${n}`)) n++;
+    const strokes = layer.strokes.map((s) => ({ ...s, seq: nextSeq() }));
+    run({
+      kind: "add-layer",
+      layer: { ...layer, id: `layer-${n}`, name: `${layer.name} copy`, strokes },
+      index: i + 1,
+    });
+  }
+
+  /**
+   * Folds a layer into the one below it. Its strokes move over in order, above the lower layer's,
+   * and keep their look: the layer's opacity is carried into each stroke.
+   */
+  function mergeDown(id: string) {
+    const i = index(id);
+    const upper = layers.value[i];
+    const lower = layers.value[i - 1];
+    if (!upper || !lower) return;
+    const carried = upper.strokes.map((s) => ({
+      ...s,
+      seq: nextSeq(),
+      opacity: Math.min(1, (s.opacity ?? 1) * (upper.opacity / Math.max(lower.opacity, 1e-3))),
+    }));
+    const merged: Layer = {
+      ...lower,
+      visible: lower.visible || upper.visible,
+      strokes: [...lower.strokes, ...carried],
+    };
+    const after = layers.value.filter((l) => l !== upper).map((l) => (l === lower ? merged : l));
+    run({ kind: "replace", before: layers.value, after });
+    active.value = lower.id;
   }
 
   function deleteLayer(id: string) {
@@ -267,6 +333,17 @@ export function useSketchbook() {
     const layer = layers.value[index(id)];
     const to = name.trim();
     if (layer && to && to !== layer.name) run({ kind: "rename-layer", id, from: layer.name, to });
+  }
+
+  /** Shows `opacity` on the layer while a slider moves, without a step in the history. */
+  function previewOpacity(id: string, opacity: number) {
+    setLayers(layers.value.map((l) => (l.id === id ? { ...l, opacity } : l)));
+  }
+
+  function setOpacity(id: string, from: number, to: number) {
+    if (from === to) return previewOpacity(id, to);
+    previewOpacity(id, from);
+    run({ kind: "layer-opacity", id, from, to });
   }
 
   function toggleLayer(id: string) {
@@ -288,7 +365,24 @@ export function useSketchbook() {
     if (strokeCount.value) replace(layers.value.map((l) => ({ ...l, strokes: [] })));
   }
 
+  /** App settings kept beside the drawing, written a moment after the last change. */
+  function savePrefs(value: unknown) {
+    prefsValue = value;
+    clearTimeout(prefsTimer);
+    prefsTimer = setTimeout(writePrefs, 300);
+  }
+
+  function writePrefs() {
+    clearTimeout(prefsTimer);
+    if (!db || prefsValue === undefined) return;
+    try {
+      db.transaction("prefs", "readwrite").objectStore("prefs").put(prefsValue, "current");
+      prefsValue = undefined;
+    } catch {}
+  }
+
   function closing(event: Event) {
+    writePrefs();
     if ((!pending && !documentChanged) || !db || closeAfterFailedRetry) return;
     event.preventDefault();
     void flush().then((ok) => {
@@ -298,11 +392,13 @@ export function useSketchbook() {
   }
 
   async function load(database: IDBDatabase) {
-    const tx = database.transaction(["strokes", "document"]);
-    const [doc, rows] = await Promise.all([
+    const tx = database.transaction(["strokes", "document", "prefs"]);
+    const [doc, rows, prefs] = await Promise.all([
       request(tx.objectStore("document").get("current")),
       request(tx.objectStore("strokes").getAll()),
+      request(tx.objectStore("prefs").get("current")),
     ]);
+    loadedPrefs = prefs;
     if (!documentRecord(doc)) return;
     const byLayer = new Map<string, Stroke[]>(doc.layers.map((l) => [l.id, []]));
     let top = doc.seq;
@@ -313,7 +409,11 @@ export function useSketchbook() {
       top = Math.max(top, stroke.seq + 1);
     }
     seq = top;
-    layers.value = doc.layers.map((l) => ({ ...l, strokes: byLayer.get(l.id)!.sort((a, b) => a.seq - b.seq) }));
+    layers.value = doc.layers.map((l) => ({
+      ...l,
+      opacity: l.opacity ?? 1,
+      strokes: byLayer.get(l.id)!.sort((a, b) => a.seq - b.seq),
+    }));
     active.value = doc.layers.some((l) => l.id === doc.active) ? doc.active : doc.layers[0]!.id;
   }
 
@@ -337,6 +437,7 @@ export function useSketchbook() {
   onBeforeUnmount(() => {
     closed = true;
     appWindow.removeEventListener("close-requested", closing);
+    writePrefs();
     void flush().finally(() => db?.close());
   });
 
@@ -348,11 +449,16 @@ export function useSketchbook() {
     canRedo,
     strokeCount,
     nextSeq,
-    addStroke,
+    addStrokes,
+    edit,
     addLayer,
+    duplicateLayer,
+    mergeDown,
     deleteLayer,
     moveLayer,
     renameLayer,
+    previewOpacity,
+    setOpacity,
     toggleLayer,
     selectLayer,
     replace,
@@ -360,5 +466,8 @@ export function useSketchbook() {
     undo,
     redo,
     flush,
+    savePrefs,
+    /** The settings stored last time, once `ready`; undefined when there were none. */
+    prefs: () => loadedPrefs,
   };
 }
