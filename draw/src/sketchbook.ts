@@ -1,7 +1,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
 import { appWindow } from "@skathi-native/runtime";
-import { isColor, STRIDE, TOOLS, type Layer, type Stroke, type Tool } from "./model";
+import type { DrawMutation } from "./events";
+import { BLEND_MODES, isColor, STRIDE, TOOLS, type Layer, type Stroke, type Tool } from "./model";
 
+type Properties = Partial<Pick<Layer, "visible" | "alphaLocked" | "clipping" | "blendMode">>;
 type Command =
   | { kind: "edit"; layer: string; removed: readonly Stroke[]; added: readonly Stroke[] }
   | { kind: "add-layer"; layer: Layer; index: number }
@@ -9,7 +11,8 @@ type Command =
   | { kind: "move-layer"; from: number; to: number }
   | { kind: "rename-layer"; id: string; from: string; to: string }
   | { kind: "layer-opacity"; id: string; from: number; to: number }
-  | { kind: "replace"; before: readonly Layer[]; after: readonly Layer[] };
+  | { kind: "properties"; id: string; from: Properties; to: Properties }
+  | { kind: "replace" | "clear"; before: readonly Layer[]; after: readonly Layer[] };
 
 type Write =
   | { kind: "put"; layer: string; stroke: Stroke }
@@ -23,7 +26,8 @@ interface StrokeRecord extends Stroke {
 
 interface DocumentRecord {
   version: 1;
-  layers: { id: string; name: string; visible: boolean; opacity?: number }[];
+  editedWhilePaused?: boolean;
+  layers: (Omit<Layer, "strokes" | "opacity"> & { opacity?: number })[];
   active: string;
   seq: number;
 }
@@ -68,7 +72,10 @@ function documentRecord(v: unknown): v is DocumentRecord {
         typeof l.id === "string" &&
         typeof l.name === "string" &&
         typeof l.visible === "boolean" &&
-        unit(l.opacity),
+        unit(l.opacity) &&
+        (l.blendMode === undefined || BLEND_MODES.some((m) => m === l.blendMode)) &&
+        (l.clipping === undefined || typeof l.clipping === "boolean") &&
+        (l.alphaLocked === undefined || typeof l.alphaLocked === "boolean"),
     )
   );
 }
@@ -104,6 +111,40 @@ function bySeq(strokes: readonly Stroke[], removed: readonly Stroke[], added: re
 
 /** The drawing: its layers, undo history and an IndexedDB copy written a stroke at a time. */
 export function useSketchbook() {
+  let emit: ((command: object, direction: "do" | "undo" | "redo", mutation: () => DrawMutation) => void) | undefined;
+  function publish(c: Command, direction: "do" | "undo" | "redo", stroke = false) {
+    emit?.(c, direction, () => {
+      const forward = direction !== "undo";
+      switch (c.kind) {
+        case "edit": {
+          if (stroke && forward) return { kind: "stroke", layer: c.layer, strokes: c.added };
+          return {
+            kind: "edit",
+            layer: c.layer,
+            removed: (forward ? c.removed : c.added).map((s) => s.seq),
+            added: forward ? c.added : c.removed,
+          };
+        }
+        case "add-layer":
+        case "delete-layer":
+          return (c.kind === "add-layer") === forward
+            ? { kind: "add-layer", layer: c.layer, index: c.index }
+            : { kind: "delete-layer", id: c.layer.id };
+        case "move-layer":
+          return { kind: "move-layer", from: forward ? c.from : c.to, to: forward ? c.to : c.from };
+        case "rename-layer":
+          return { kind: "layer", id: c.id, changes: { name: forward ? c.to : c.from } };
+        case "layer-opacity":
+          return { kind: "layer", id: c.id, changes: { opacity: forward ? c.to : c.from } };
+        case "properties":
+          return { kind: "layer", id: c.id, changes: forward ? c.to : c.from };
+        case "clear":
+          return forward ? { kind: "clear" } : { kind: "replace", layers: c.before };
+        case "replace":
+          return { kind: "replace", layers: forward ? c.after : c.before };
+      }
+    });
+  }
   const layers = shallowRef<readonly Layer[]>([blank(1)]);
   const active = ref("layer-1");
   const ready = ref(false);
@@ -113,6 +154,7 @@ export function useSketchbook() {
   const canRedo = computed(() => undone.value.length > 0);
   const strokeCount = computed(() => layers.value.reduce((n, l) => n + l.strokes.length, 0));
   let seq = 1;
+  let editedWhilePaused = false;
   let db: IDBDatabase | undefined;
   let writes: Write[] = [];
   let documentChanged = false;
@@ -120,6 +162,9 @@ export function useSketchbook() {
   let pending: Promise<boolean> | undefined;
   let closed = false;
   let closeAfterFailedRetry = false;
+  let closeApproved = false;
+  let closingTask = false;
+  let flushExtra: (() => Promise<void>) | undefined;
   let prefsTimer: ReturnType<typeof setTimeout> | undefined;
   let prefsValue: unknown;
   let loadedPrefs: unknown;
@@ -142,7 +187,8 @@ export function useSketchbook() {
     const batch = writes;
     const doc: DocumentRecord = {
       version: 1,
-      layers: layers.value.map(({ id, name, visible, opacity }) => ({ id, name, visible, opacity })),
+      editedWhilePaused,
+      layers: layers.value.map(({ strokes: _strokes, ...properties }) => properties),
       active: active.value,
       seq,
     };
@@ -223,6 +269,13 @@ export function useSketchbook() {
         persist();
         break;
       }
+      case "properties": {
+        const i = index(c.id);
+        if (list[i]) list[i] = { ...list[i]!, ...(forward ? c.to : c.from) };
+        persist();
+        break;
+      }
+      case "clear":
       case "replace": {
         const next = forward ? c.after : c.before;
         persist({ kind: "wipe" });
@@ -236,12 +289,13 @@ export function useSketchbook() {
     setLayers(list);
   }
 
-  function run(c: Command) {
+  function run(c: Command, stroke = false) {
     if (!ready.value) return;
     closeAfterFailedRetry = false;
     apply(c, true);
     done.value = [...done.value.slice(1 - HISTORY), c];
     undone.value = [];
+    publish(c, "do", stroke);
   }
 
   function undo() {
@@ -250,6 +304,7 @@ export function useSketchbook() {
     apply(c, false);
     done.value = done.value.slice(0, -1);
     undone.value = [...undone.value, c];
+    publish(c, "undo");
   }
 
   function redo() {
@@ -258,6 +313,7 @@ export function useSketchbook() {
     apply(c, true);
     undone.value = undone.value.slice(0, -1);
     done.value = [...done.value, c];
+    publish(c, "redo");
   }
 
   /** A stroke number, unique in this drawing and above every earlier one. */
@@ -266,7 +322,7 @@ export function useSketchbook() {
   /** Adds strokes to the active layer as one step: a stroke, or a stroke and its mirrored copies. */
   function addStrokes(strokes: readonly Stroke[]) {
     const layer = activeLayer();
-    if (layer?.visible && strokes.length) run({ kind: "edit", layer: layer.id, removed: [], added: strokes });
+    if (layer?.visible && strokes.length) run({ kind: "edit", layer: layer.id, removed: [], added: strokes }, true);
   }
 
   /** Replaces `removed` with `added` in one layer, as one step. */
@@ -347,8 +403,19 @@ export function useSketchbook() {
   }
 
   function toggleLayer(id: string) {
-    setLayers(layers.value.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
-    persist();
+    const l = layers.value[index(id)];
+    if (l) setProperties(id, { visible: !l.visible });
+  }
+
+  function setProperties(id: string, to: Properties) {
+    const l = layers.value[index(id)];
+    if (!l) return;
+    const from: Properties = {};
+    if (to.visible !== undefined) from.visible = l.visible;
+    if (to.clipping !== undefined) from.clipping = l.clipping ?? false;
+    if (to.alphaLocked !== undefined) from.alphaLocked = l.alphaLocked ?? false;
+    if (to.blendMode !== undefined) from.blendMode = l.blendMode ?? "normal";
+    run({ kind: "properties", id, to, from });
   }
 
   function selectLayer(id: string) {
@@ -358,11 +425,21 @@ export function useSketchbook() {
   }
 
   function replace(after: readonly Layer[]) {
+    for (const l of after) for (const s of l.strokes) seq = Math.max(seq, s.seq + 1);
     run({ kind: "replace", before: layers.value, after });
   }
 
+  function recoverDocument(after: readonly Layer[], activeId: string) {
+    for (const l of after) for (const s of l.strokes) seq = Math.max(seq, s.seq + 1);
+    apply({ kind: "replace", before: layers.value, after }, true);
+    selectLayer(activeId);
+    done.value = [];
+    undone.value = [];
+  }
+
   function clear() {
-    if (strokeCount.value) replace(layers.value.map((l) => ({ ...l, strokes: [] })));
+    if (strokeCount.value)
+      run({ kind: "clear", before: layers.value, after: layers.value.map((l) => ({ ...l, strokes: [] })) });
   }
 
   /** App settings kept beside the drawing, written a moment after the last change. */
@@ -383,12 +460,23 @@ export function useSketchbook() {
 
   function closing(event: Event) {
     writePrefs();
-    if ((!pending && !documentChanged) || !db || closeAfterFailedRetry) return;
+    if (closeApproved || closeAfterFailedRetry) return;
     event.preventDefault();
-    void flush().then((ok) => {
-      if (ok && !documentChanged) appWindow.close();
-      else if (!ok) closeAfterFailedRetry = true;
-    });
+    if (closingTask) return;
+    closingTask = true;
+    void Promise.all([flush(), flushExtra?.()])
+      .then(([ok]) => {
+        if (ok || !db) {
+          closeApproved = true;
+          appWindow.close();
+        } else closeAfterFailedRetry = true;
+      })
+      .catch(() => {
+        closeAfterFailedRetry = true;
+      })
+      .finally(() => {
+        closingTask = false;
+      });
   }
 
   async function load(database: IDBDatabase) {
@@ -409,6 +497,7 @@ export function useSketchbook() {
       top = Math.max(top, stroke.seq + 1);
     }
     seq = top;
+    editedWhilePaused = doc.editedWhilePaused === true;
     layers.value = doc.layers.map((l) => ({
       ...l,
       opacity: l.opacity ?? 1,
@@ -460,13 +549,28 @@ export function useSketchbook() {
     previewOpacity,
     setOpacity,
     toggleLayer,
+    setProperties,
+    onCommand(fn: NonNullable<typeof emit>) {
+      emit = fn;
+    },
     selectLayer,
     replace,
+    recoverDocument,
     clear,
     undo,
     redo,
     flush,
     savePrefs,
+    editedWhilePaused: () => editedWhilePaused,
+    markPausedEdits(value: boolean) {
+      if (editedWhilePaused !== value) {
+        editedWhilePaused = value;
+        persist();
+      }
+    },
+    onFlush(fn: () => Promise<void>) {
+      flushExtra = fn;
+    },
     /** The settings stored last time, once `ready`; undefined when there were none. */
     prefs: () => loadedPrefs,
   };

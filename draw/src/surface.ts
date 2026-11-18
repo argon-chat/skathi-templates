@@ -27,6 +27,7 @@ import {
   STRIDE,
   type Color,
   type Ink,
+  type Layer,
   type Mode,
   type Paper,
   type Shape,
@@ -37,6 +38,7 @@ import {
 } from "./model";
 import { Marks, type Rgba } from "./overlay";
 import { meshOf, Renderer, type View } from "./renderer";
+import type { DrawRecording, DrawMutation } from "./events";
 import type { useSketchbook } from "./sketchbook";
 
 const BARREL = 2;
@@ -64,6 +66,7 @@ interface Options {
   dark: Ref<boolean>;
   paper: Ref<Paper>;
   symmetry: Ref<Symmetry | null>;
+  notify: (message: string) => void;
   onPick: (color: Color) => void;
 }
 
@@ -76,6 +79,7 @@ type Gesture =
   | { kind: "pinch"; distance: number; angle: number; zoom: number; viewAngle: number; docX: number; docY: number }
   | { kind: "lasso"; id: number; points: number[] }
   | { kind: "transform"; id: number; handle: Handle; start: Point; m: Affine; moved: boolean }
+  | { kind: "bucket"; id: number; point: Point }
   | { kind: "pick"; id: number };
 
 interface Selection {
@@ -144,6 +148,12 @@ export function useSurface(o: Options) {
   let view: View = { zoom: 1, angle: 0, x: 0, y: 0 };
   let size = { w: 0, h: 0 };
   let gesture: Gesture | null = null;
+  let playback = false;
+  let processing = false;
+  let onCancelDraft: (() => void) | undefined;
+  let inputsEnabled = true;
+  let holdTimer: ReturnType<typeof setInterval> | undefined;
+  let previewPaper = "";
   let selection: Selection | null = null;
   let penSeen = penSeenBefore();
   let penInRange = false;
@@ -204,8 +214,8 @@ export function useSurface(o: Options) {
   const home = () => setView({ zoom: 1, angle: 0, x: size.w / 2, y: size.h / 2 });
 
   /** Fits the drawing between the title strip and the toolbar, at 100% at most, keeping the rotation. */
-  function fitContent() {
-    const b = contentBounds();
+  function fitContent(layers: readonly Layer[] = book.layers.value) {
+    const b = contentBounds(layers);
     if (!b) return home();
     const top = 56;
     const bottom = 112;
@@ -259,24 +269,60 @@ export function useSurface(o: Options) {
     return layer?.visible ? layer : null;
   }
 
-  const strokeOptions = (s: ToolSettings) => (s.opacity < 1 ? { opacity: s.opacity } : {});
+  function newStroke(tool: Tool, layer: Layer): Stroke {
+    const s = settings[tool];
+    const seq = book.nextSeq();
+    return {
+      seq,
+      tool,
+      color: tool === "eraser" ? "ink" : color.value,
+      width: s.size,
+      points: [],
+      ...(s.opacity < 1 && { opacity: s.opacity }),
+      ...(layer.alphaLocked && { alphaLocked: true }),
+      ...((tool === "spray" || tool === "pencil" || tool === "airbrush") && { seed: Math.imul(seq, 2654435761) >>> 0 }),
+      ...(s.scatter !== undefined && { scatter: s.scatter }),
+      ...(s.density !== undefined && { density: s.density }),
+      ...(s.hardness !== undefined && { hardness: s.hardness }),
+    };
+  }
+  function addPoint(live: LiveStroke, x: number, y: number, p: number, tx: number, ty: number, tw: number, t: number) {
+    const pts = live.stroke.points;
+    live.add(
+      Math.round(x * 16) / 16,
+      Math.round(y * 16) / 16,
+      Math.round(p * 65535) / 65535,
+      Math.round(tx),
+      Math.round(ty),
+      Math.round(tw),
+      Math.max(pts.at(-1) ?? 0, Math.round(t)),
+    );
+  }
+  function startDeposition() {
+    const start = performance.now();
+    const g = gesture;
+    if (g?.kind !== "draw") return;
+    const origin = g.lives[0]!.stroke.points.at(-1) ?? 0;
+    holdTimer = setInterval(() => {
+      if (gesture !== g) return;
+      for (const live of g.lives) {
+        const a = live.stroke.points,
+          i = a.length - STRIDE;
+        const t = origin + performance.now() - start;
+        if (t - a[i + 6]! < 30) continue;
+        addPoint(live, a[i]!, a[i + 1]!, a[i + 2]!, a[i + 3]!, a[i + 4]!, a[i + 5]!, t);
+        live.build([]);
+      }
+      renderer?.updateLive();
+    }, 40);
+  }
 
   function startDraw(e: PointerEvent, t: Tool) {
     const layer = activeLayer();
     if (!layer || !renderer) return;
     const s = settings[t];
     const transforms = symmetryTransforms(o.symmetry.value);
-    const lives = transforms.map(
-      () =>
-        new LiveStroke({
-          seq: book.nextSeq(),
-          tool: t,
-          color: t === "eraser" ? "ink" : color.value,
-          width: s.size,
-          points: [],
-          ...strokeOptions(s),
-        }),
-    );
+    const lives = transforms.map(() => new LiveStroke(newStroke(t, layer)));
     gesture = {
       kind: "draw",
       id: e.pointerId,
@@ -290,6 +336,7 @@ export function useSurface(o: Options) {
     sample(e, true);
     for (const live of lives) live.build([]);
     renderer.beginLive(layer.id, lives);
+    if (t === "spray" || t === "airbrush") startDeposition();
   }
 
   function sample(e: PointerEvent, force = false) {
@@ -304,12 +351,14 @@ export function useSurface(o: Options) {
     const d = toDoc(at.x, at.y);
     for (const [i, live] of g.lives.entries()) {
       const q = apply(g.transforms[i]!, d.x, d.y);
-      live.add(q.x, q.y, p, e.tiltX, e.tiltY, e.twist, t);
+      addPoint(live, q.x, q.y, p, e.tiltX, e.tiltY, e.twist, t);
     }
   }
 
   function finishDraw(e: PointerEvent | null) {
     if (gesture?.kind !== "draw") return;
+    clearInterval(holdTimer);
+    if (!e) onCancelDraft?.();
     const { lives, transforms, stab } = gesture;
     gesture = null;
     drawing.value = false;
@@ -321,30 +370,66 @@ export function useSurface(o: Options) {
         const n = pts.length;
         const q = apply(transforms[i]!, d.x, d.y);
         if (!stab.trailing && Math.hypot(q.x - pts[n - 7]!, q.y - pts[n - 6]!) * view.zoom > 0.3)
-          live.add(q.x, q.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp);
+          addPoint(live, q.x, q.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp);
       }
-      book.addStrokes(lives.map((l) => l.stroke).filter((s) => s.points.length));
+      const strokes = lives
+        .map((l) => l.stroke)
+        .filter((s) => s.points.length && (s.tool !== "lasso-fill" || s.points.length >= 3 * STRIDE));
+      const layer = activeLayer();
+      const gpu = renderer;
+      if (layer && gpu && strokes[0]?.tool === "smudge") {
+        void resolvePaint(layer, () => Promise.all(strokes.map((s) => gpu.smudge(s, layer.id))));
+      } else book.addStrokes(strokes);
       renderer?.setLayers(book.layers.value);
     }
     renderer?.endLive();
+  }
+
+  async function resolvePaint(layer: Layer, run: () => Promise<Stroke[]>) {
+    processing = true;
+    try {
+      const result = await run();
+      if (!playback && activeLayer() === layer && result.length) book.addStrokes(result);
+    } catch (e) {
+      o.notify(e instanceof Error ? e.message : "Could not sample this layer");
+    } finally {
+      processing = false;
+    }
+  }
+
+  function fillAt(point: Point) {
+    const layer = activeLayer(),
+      gpu = renderer;
+    if (!layer || !gpu) return;
+    const s = settings.bucket,
+      stroke = newStroke("bucket", layer);
+    void resolvePaint(layer, async () => {
+      const contours = await gpu.bucket(point.x, point.y, {
+        ...(s.currentLayer && { layer: layer.id }),
+        tolerance: s.tolerance ?? 24,
+        gap: s.gap ?? 0,
+        expand: s.expand ?? 1,
+      });
+      if (!contours?.length) {
+        o.notify("This area is open. Close its outline to fill it.");
+        return [];
+      }
+      stroke.points = [point.x, point.y, 1, 0, 0, 0, 0];
+      stroke.contours = contours;
+      return [stroke];
+    });
   }
 
   function startShape(e: PointerEvent) {
     const layer = activeLayer();
     if (!layer || !renderer) return;
     const t = o.inkTool.value;
-    const s = settings[t];
     const transforms = symmetryTransforms(o.symmetry.value);
     const lives = transforms.map(
       () =>
         new LiveShape({
-          seq: book.nextSeq(),
-          tool: t,
-          color: color.value,
-          width: s.size,
-          points: [],
+          ...newStroke(t, layer),
           shape: true,
-          ...strokeOptions(s),
         }),
     );
     gesture = { kind: "shape", id: e.pointerId, start: { x: e.clientX, y: e.clientY }, lives, transforms };
@@ -362,7 +447,7 @@ export function useSurface(o: Options) {
       const points: number[] = [];
       for (const [k, p] of doc.entries()) {
         const q = apply(g.transforms[i]!, p.x, p.y);
-        points.push(q.x, q.y, SHAPE_PRESSURE, 0, 0, 0, k);
+        points.push(Math.round(q.x * 16) / 16, Math.round(q.y * 16) / 16, SHAPE_PRESSURE, 0, 0, 0, k);
       }
       live.set(points);
     }
@@ -373,6 +458,7 @@ export function useSurface(o: Options) {
     if (gesture?.kind !== "shape") return;
     const g = gesture;
     if (e) moveShape(e);
+    else onCancelDraft?.();
     gesture = null;
     drawing.value = false;
     const far = e && Math.hypot(e.clientX - g.start.x, e.clientY - g.start.y) > 3;
@@ -394,7 +480,9 @@ export function useSurface(o: Options) {
   }
 
   function cancelGesture() {
+    clearInterval(holdTimer);
     if (gesture?.kind === "draw" || gesture?.kind === "shape") {
+      onCancelDraft?.();
       renderer?.endLive();
       drawing.value = false;
     }
@@ -428,7 +516,8 @@ export function useSurface(o: Options) {
       gesture = { kind: "pan", id: e.pointerId, x: e.clientX, y: e.clientY };
       panning.value = true;
       renderer?.setCursor(0, 0, 0, false);
-    } else if (m === "select") pressSelect(e);
+    } else if (m === "bucket") gesture = { kind: "bucket", id: e.pointerId, point: toDoc(e.clientX, e.clientY) };
+    else if (m === "select") pressSelect(e);
     else if (m === "shape") startShape(e);
     else if (m === "eyedropper") {
       gesture = { kind: "pick", id: e.pointerId };
@@ -437,6 +526,7 @@ export function useSurface(o: Options) {
   }
 
   function down(e: PointerEvent) {
+    if (!inputsEnabled || playback || processing || !book.ready.value) return;
     if (e.pointerType === "pen") {
       lastPen = performance.now();
       penInRange = true;
@@ -469,6 +559,7 @@ export function useSurface(o: Options) {
   }
 
   function move(e: PointerEvent) {
+    if (playback) return;
     if (e.pointerType === "pen") {
       lastPen = performance.now();
       penInRange = true;
@@ -555,6 +646,10 @@ export function useSurface(o: Options) {
     if (!g || g.kind === "pinch" || g.id !== e.pointerId) return;
     const cancelled = e.type === "pointercancel";
     switch (g.kind) {
+      case "bucket":
+        gesture = null;
+        if (!cancelled) fillAt(g.point);
+        return;
       case "draw":
         return finishDraw(cancelled ? null : e);
       case "shape":
@@ -584,6 +679,7 @@ export function useSurface(o: Options) {
   }
 
   function leave(e: PointerEvent) {
+    if (playback) return;
     if (e.pointerType === "pen") penInRange = false;
     if (!gesture) {
       ring(e, false);
@@ -596,6 +692,7 @@ export function useSurface(o: Options) {
 
   function wheel(e: WheelEvent) {
     e.preventDefault();
+    if (playback) return;
     const unit = e.deltaMode === 1 ? 16 : e.deltaMode === 2 ? size.h : 1;
     const dx = e.deltaX * unit;
     const dy = e.deltaY * unit;
@@ -832,6 +929,7 @@ export function useSurface(o: Options) {
 
   function buildOverlay(): Uint8Array {
     marks.reset();
+    if (playback) return marks.view();
     const sym = o.symmetry.value;
     if (sym) {
       const c = toScreen(sym.x, sym.y);
@@ -872,9 +970,9 @@ export function useSurface(o: Options) {
   }
 
   /** The drawn area of the visible layers, in document units. */
-  function contentBounds(): Bounds | null {
+  function contentBounds(layers: readonly Layer[] = book.layers.value): Bounds | null {
     let b: Bounds | null = null;
-    for (const layer of book.layers.value) {
+    for (const layer of layers) {
       if (!layer.visible) continue;
       for (const stroke of layer.strokes) if (stroke.tool !== "eraser") b = union(b, meshOf(stroke).bounds);
     }
@@ -925,6 +1023,7 @@ export function useSurface(o: Options) {
   }
 
   watch(book.layers, (layers) => {
+    if (playback) return;
     renderer?.setLayers(layers);
     const s = selection;
     if (!s) return;
@@ -961,6 +1060,7 @@ export function useSurface(o: Options) {
   });
 
   onBeforeUnmount(() => {
+    clearInterval(holdTimer);
     removeEventListener("resize", fit);
     renderer?.destroy();
     renderer = null;
@@ -979,6 +1079,69 @@ export function useSurface(o: Options) {
     selected,
     cursor,
     handlers: { down, move, up, leave, wheel },
+    getView: () => ({ ...view }),
+    setView,
+    toScreen,
+    beginPlayback() {
+      cancelGesture();
+      clearSelection();
+      loupe = null;
+      playback = true;
+      previewPaper = "";
+      renderer?.setCursor(0, 0, 0, false);
+    },
+    present(layers: readonly Layer[], dark: boolean, paper: Paper) {
+      const key = paper + dark;
+      if (key !== previewPaper) {
+        const m = dark ? "dark" : "light";
+        renderer?.setTheme(rgbUnit(PAPER[m]), rgbUnit(INK[m]), paper, dark ? 0.16 : 0.2);
+        previewPaper = key;
+      }
+      renderer?.setLayers(layers);
+    },
+    endPlayback() {
+      playback = false;
+      renderer?.setLayers(book.layers.value);
+      theme();
+    },
+    painting: () => drawing.value || processing,
+    enableInput(value: boolean) {
+      inputsEnabled = value;
+    },
+    onCancelDraft(fn: () => void) {
+      onCancelDraft = fn;
+    },
+    async checkpoint(): Promise<Extract<DrawMutation, { kind: "stroke" }> | null> {
+      const g = gesture,
+        layer = activeLayer(),
+        gpu = renderer;
+      if (!g || (g.kind !== "draw" && g.kind !== "shape") || !layer || !gpu) return null;
+      let strokes = g.lives.map((l) => l.stroke).filter((s) => s.points.length);
+      if (strokes.some((s) => s.tool === "smudge"))
+        strokes = await Promise.all(strokes.map((s) => gpu.smudge({ ...s, points: s.points.slice() }, layer.id)));
+      return g === gesture && strokes.length ? { kind: "stroke", layer: layer.id, strokes } : null;
+    },
+    async preparePlayback(file: DrawRecording, isCurrent: () => boolean) {
+      function* geometry() {
+        for (const l of file.initial?.layers ?? []) yield* l.strokes;
+        for (const e of file.events) {
+          const m = e.kind === "undo" || e.kind === "redo" ? e.fallback : e;
+          if (m?.kind === "stroke") yield* m.strokes;
+          else if (m?.kind === "edit") yield* m.added;
+          else if (m?.kind === "add-layer") yield* m.layer.strokes;
+          else if (m?.kind === "replace") for (const l of m.layers) yield* l.strokes;
+        }
+      }
+      let since = performance.now();
+      for (const stroke of geometry()) {
+        meshOf(stroke);
+        if (performance.now() - since > 8) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 0));
+          if (!isCurrent()) return;
+          since = performance.now();
+        }
+      }
+    },
     zoomBy,
     zoomTo,
     rotateBy,
