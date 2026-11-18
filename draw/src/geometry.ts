@@ -85,19 +85,29 @@ export function insidePolygon(x: number, y: number, poly: readonly number[]): bo
 
 /** Squared distance from `(x, y)` to the stroke's polyline. */
 export function distanceToStroke(stroke: Stroke, x: number, y: number): number {
-  const p = stroke.points;
   let best = Infinity;
-  for (let i = 0; i < p.length; i += STRIDE) {
-    const ax = p[i]!;
-    const ay = p[i + 1]!;
-    const bx = p[i + STRIDE] ?? ax;
-    const by = p[i + STRIDE + 1] ?? ay;
+  const segment = (ax: number, ay: number, bx: number, by: number) => {
     const dx = bx - ax;
     const dy = by - ay;
     const len = dx * dx + dy * dy;
     const t = len ? Math.max(0, Math.min(1, ((x - ax) * dx + (y - ay) * dy) / len)) : 0;
     best = Math.min(best, (ax + dx * t - x) ** 2 + (ay + dy * t - y) ** 2);
+  };
+  if (stroke.tool === "bucket" || stroke.tool === "lasso-fill") {
+    const outline: number[] = [];
+    if (!stroke.contours)
+      for (let i = 0; i < stroke.points.length; i += STRIDE) outline.push(stroke.points[i]!, stroke.points[i + 1]!);
+    let inside = false;
+    for (const ring of stroke.contours ?? [outline]) {
+      if (insidePolygon(x, y, ring)) inside = !inside;
+      for (let i = 0, j = ring.length - 2; i < ring.length; j = i, i += 2)
+        segment(ring[j]!, ring[j + 1]!, ring[i]!, ring[i + 1]!);
+    }
+    return inside ? 0 : best;
   }
+  const p = stroke.points;
+  for (let i = 0; i < p.length; i += STRIDE)
+    segment(p[i]!, p[i + 1]!, p[i + STRIDE] ?? p[i]!, p[i + STRIDE + 1] ?? p[i + 1]!);
   return best;
 }
 
