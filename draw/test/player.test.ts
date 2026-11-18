@@ -3,6 +3,8 @@ import type { DrawEvent, DrawRecording } from "../src/events";
 import { decodeRecording, recordingHeader, metaChunk, snapshotChunk, eventsChunk, joinBytes } from "../src/events";
 import { type Layer, type Stroke } from "../src/model";
 import { PlaybackTimeline } from "../src/playbackTimeline";
+import { pixelPng } from "./fixtureV2";
+import { reconcileDrawing, uiChanges } from "../src/recordingChanges";
 
 function line(seq: number): Stroke {
   return { seq, tool: "pen", width: 4, color: "ink", points: [10, 20, 1, 0, 0, 0, 4000, 30, 20, 1, 0, 0, 0, 4100] };
@@ -23,7 +25,8 @@ function recording(events: DrawEvent[], initial?: Layer): DrawRecording {
 const layer = "layer-1";
 
 test("a grouped layer merge encodes its delta and restores both layers in one undo step", async () => {
-  const base: Layer = { id: layer, name: "Base", strokes: [line(1)], opacity: 0.5, visible: true };
+  const half = 32768 / 65535;
+  const base: Layer = { id: layer, name: "Base", strokes: [line(1)], opacity: half, visible: true };
   const upper: Layer = { ...base, id: "layer-2", name: "Upper", strokes: [line(2)] };
   const untouched: Layer = {
     ...base,
@@ -34,8 +37,10 @@ test("a grouped layer merge encodes its delta and restores both layers in one un
   const baked: Stroke = {
     ...line(530),
     tool: "bucket",
+    seed: 530,
+    opacity: 1,
     points: [0, 0, 1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0],
-    patch: { x: 0, y: 0, width: 1, height: 1, rgba: "AAAA/w==" },
+    patch: { x: 0, y: 0, width: 1, height: 1, png: pixelPng },
   };
   const initial = { active: upper.id, layers: [base, upper, untouched] };
   const merge: DrawEvent = {
@@ -60,7 +65,7 @@ test("a grouped layer merge encodes its delta and restores both layers in one un
     first = file.initial!.layers,
     back = timeline.frame(20, true);
   expect(back.layers).toEqual(first);
-  expect(back.active).toBe(base.id);
+  expect(back.active).toBe(upper.id);
   const final = timeline.frame(30, true);
   expect(final.layers[0]).toEqual({ ...first[0], opacity: 1, strokes: [baked] });
   expect(final.layers[1]).toBe(first[2]);
@@ -73,7 +78,7 @@ test("a grouped layer merge encodes its delta and restores both layers in one un
       kind: "group",
       changes: [
         { kind: "add-layer", index: 1, layer: first[1]! },
-        { kind: "layer", id: base.id, changes: { opacity: 0.5 } },
+        { kind: "layer", id: base.id, changes: { opacity: half } },
         { kind: "edit", layer: base.id, removed: [530], added: first[0]!.strokes },
       ],
     },
@@ -96,6 +101,89 @@ test("stroke growth follows point time across intervening interface events", () 
   expect(middle.layers[0]!.strokes[1]!.points.at(-1)).toBe(4050);
   expect(middle.ui.color).toBe("#ff0000");
   expect(tape.frame(150, true).layers[0]!.strokes).toEqual([line(1), line(2)]);
+});
+
+test("recovery preserves unchanged strokes and records only the document differences", () => {
+  const start: Layer = { id: layer, name: "Ink", visible: true, opacity: 1, strokes: [line(1), line(2)] };
+  const other: Layer = { ...start, id: "layer-2", name: "Empty", strokes: [] };
+  const end = [
+    { ...other, name: "Wash", strokes: [line(3)] },
+    { ...start, strokes: [line(2)] },
+  ];
+  const change = reconcileDrawing([start, other], end, "layer-2");
+  expect(change.kind).toBe("group");
+  if (change.kind !== "group") throw new Error("Expected a delta group.");
+  expect(change.changes.filter((s) => s.kind === "edit").flatMap((s) => s.added.map((s) => s.seq))).toEqual([3]);
+  const file = recording([{ ...change, at: 10 }]);
+  file.initial = { active: layer, layers: [start, other] };
+  const frame = new PlaybackTimeline(file).final;
+  expect(frame.layers.map((l) => l.strokes)).toEqual(end.map((l) => l.strokes));
+  expect(frame.layers[1]!.strokes[0]).toBe(start.strokes[1]);
+  expect(frame.active).toBe("layer-2");
+});
+
+test("copy references preserve geometry when the source is removed in the same merge", () => {
+  const copy = {
+    kind: "group" as const,
+    active: "layer-2",
+    changes: [
+      {
+        kind: "add-layer" as const,
+        index: 1,
+        layer: { id: "layer-2", name: "Copy", opacity: 1, visible: true, strokes: [] },
+      },
+      {
+        kind: "edit" as const,
+        layer: "layer-2",
+        removed: [],
+        added: [],
+        copies: [{ layer, seq: 1, as: 2, scope: [2] }],
+      },
+    ],
+  };
+  const tape = new PlaybackTimeline(
+    recording([
+      { kind: "stroke", layer, strokes: [line(1)], at: 100 },
+      { ...copy, at: 200 },
+      { kind: "undo", at: 220 },
+      { kind: "redo", at: 260 },
+      { kind: "edit", layer: "layer-2", removed: [2], added: [line(3)], at: 300 },
+      { kind: "undo", at: 300 },
+    ]),
+  );
+  const final = tape.frame(300, false);
+  expect(final.layers[1]!.strokes).toEqual([{ ...line(1), seed: 1, seq: 2, scope: [2] }]);
+  expect(final.layers[1]!.strokes[0]!.points).toBe(final.layers[0]!.strokes[0]!.points);
+  expect(tape.frame(200, false).layers.length).toBe(1);
+});
+
+test("UI delta emits one field per change and ignores structurally equal symmetry updates", () => {
+  const state = {
+    mode: "pen" as const,
+    color: "ink",
+    dark: false,
+    symmetry: { mirror: true, segments: 1, x: 10, y: 11 },
+  };
+  expect(uiChanges(state, { ...state, symmetry: { ...state.symmetry } })).toEqual([]);
+  expect(uiChanges(state, { ...state, color: "#808080", size: 10 })).toEqual([{ color: "#808080" }, { size: 10 }]);
+});
+
+test("long interface-only sections share their document across keyframes", () => {
+  const initial: Layer = {
+    id: layer,
+    name: "Ink",
+    visible: true,
+    opacity: 1,
+    strokes: Array.from({ length: 55_000 }, (_, i) => line(i)),
+  };
+  const file = recording(
+    Array.from({ length: 160_000 }, (_, i) => ({ kind: "ui", state: { size: 1 + (i % 16) }, at: i + 1 })),
+    initial,
+  );
+  const timeline = new PlaybackTimeline(file);
+  expect(timeline.frame(120_000, true).layers).toBe(file.initial!.layers);
+  expect(timeline.frame(33_333, true).layers).toBe(file.initial!.layers);
+  expect(timeline.frame(137_412, false).layers).toBe(file.initial!.layers);
 });
 
 test("hidden undone strokes reappear only if redone, and branching keeps the forward state", () => {

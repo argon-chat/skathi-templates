@@ -123,7 +123,6 @@ export function createPlayer(output: Output) {
     if (!Number.isFinite(ms)) throw new Error("Seek time must be a finite number of milliseconds.");
     pause();
     display(ms);
-    if (position.value === duration.value) finish();
     await nextTick();
     await output.settled?.();
   }
@@ -137,7 +136,6 @@ export function createPlayer(output: Output) {
       return;
     }
     display(e.at, count.value + 1);
-    if (count.value === eventCount.value && position.value === duration.value) finish();
   }
 
   function configure(options: PlayOptions) {

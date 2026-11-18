@@ -1,4 +1,5 @@
 import type { DrawAction, DrawAtomic, DrawEvent, DrawRecording, DrawSnapshot, DrawUi } from "./events";
+import { LIMITS } from "./eventBinary";
 import { clamp, STRIDE, type Layer, type Stroke } from "./model";
 import type { View } from "./renderer";
 
@@ -12,6 +13,10 @@ type Atomic = DrawAtomic | { kind: "restore-properties"; layer: Layer };
 type Mutation = Atomic | { kind: "group"; changes: readonly Atomic[]; active?: string };
 type Change = Mutation | Extract<DrawAction, { kind: "ui" | "view" }>;
 type Step = { change: Change; command?: number; forward?: boolean };
+const layerLimit = () =>
+  new Error(
+    `A recording can contain up to ${LIMITS.layers} simultaneous layers. Start a new recording with fewer layers.`,
+  );
 
 class Drawing {
   layers: Layer[];
@@ -19,9 +24,12 @@ class Drawing {
   ui: DrawUi;
   view: View;
   private writable = new Map<readonly Stroke[], Stroke[]>();
+  private published: readonly Layer[] | null;
 
   constructor(frame: PlayerFrame) {
+    if (frame.layers.length > LIMITS.layers) throw layerLimit();
     this.layers = [...frame.layers];
+    this.published = frame.layers;
     this.active = frame.active;
     this.ui = frame.ui;
     this.view = frame.view;
@@ -29,10 +37,12 @@ class Drawing {
 
   frame(): PlayerFrame {
     this.writable.clear();
-    return { layers: [...this.layers], active: this.active, ui: this.ui, view: this.view, cursor: null };
+    this.published ??= [...this.layers];
+    return { layers: this.published, active: this.active, ui: this.ui, view: this.view, cursor: null };
   }
 
   apply(change: Change, inverse = false): Mutation | undefined {
+    if (change.kind !== "ui" && change.kind !== "view") this.published = null;
     switch (change.kind) {
       case "group": {
         const active = this.active;
@@ -43,7 +53,7 @@ class Drawing {
         }
         const target = change.active ?? active;
         if (this.layers.some((l) => l.id === target)) this.active = target;
-        if (inverse) return { kind: "group", changes: reverse.reverse() };
+        if (inverse) return { kind: "group", changes: reverse.reverse(), active };
         break;
       }
       case "ui":
@@ -59,11 +69,32 @@ class Drawing {
         const i = this.layers.findIndex((layer) => layer.id === change.layer);
         const layer = this.layers[i];
         if (!layer) break;
-        const added = change.kind === "stroke" ? change.strokes : change.added;
+        let added = change.kind === "stroke" ? change.strokes : change.added;
+        if (change.kind === "edit" && change.copies?.length) {
+          const sources = new Map<string, Map<number, Stroke>>();
+          const copies = change.copies.map((copy) => {
+            let strokes = sources.get(copy.layer);
+            if (!strokes) {
+              strokes = new Map(this.layers.find((l) => l.id === copy.layer)?.strokes.map((s) => [s.seq, s]));
+              sources.set(copy.layer, strokes);
+            }
+            const original = strokes.get(copy.seq);
+            if (!original) throw new Error("Invalid recording: copied stroke is missing.");
+            return {
+              ...original,
+              seed: original.seed ?? original.seq,
+              seq: copy.as,
+              ...(copy.opacity !== undefined && { opacity: copy.opacity }),
+              ...(copy.scope && { scope: copy.scope }),
+            };
+          });
+          added = [...added, ...copies];
+        }
         const removed = change.kind === "edit" && change.removed.length ? new Set(change.removed) : null;
         let strokes = this.writable.get(layer.strokes);
         const old: Stroke[] = [];
         if (removed) {
+          this.writable.delete(layer.strokes);
           strokes = layer.strokes.filter((s) => {
             if (!removed.has(s.seq)) return true;
             if (inverse) old.push(s);
@@ -87,6 +118,8 @@ class Drawing {
         break;
       }
       case "add-layer":
+        if (this.layers.length >= LIMITS.layers) throw layerLimit();
+        if (this.layers.some((l) => l.id === change.layer.id)) throw new Error("Invalid recording: duplicate layer.");
         this.layers.splice(change.index, 0, change.layer);
         this.active = change.layer.id;
         if (inverse) return { kind: "delete-layer", id: change.layer.id };
@@ -118,6 +151,7 @@ class Drawing {
       }
       case "replace":
       case "clear": {
+        if (change.kind === "replace" && change.layers.length > LIMITS.layers) throw layerLimit();
         const before = this.layers;
         this.layers = change.kind === "replace" ? [...change.layers] : before.map((l) => ({ ...l, strokes: [] }));
         this.writable.clear();
@@ -138,9 +172,7 @@ function initialFrame(file: DrawRecording): PlayerFrame {
   return { ...first, ui: { paper: file.meta.paper, dark: file.meta.dark }, view: file.meta.view, cursor: null };
 }
 
-const PERIOD = 128;
-
-function indexActions(events: readonly DrawEvent[], initial: PlayerFrame) {
+function indexActions(events: readonly DrawEvent[], initial: PlayerFrame, period: number) {
   const steps: (Step | undefined)[] = [];
   const checkpoints = [initial];
   const drawing = new Drawing(initial);
@@ -186,7 +218,7 @@ function indexActions(events: readonly DrawEvent[], initial: PlayerFrame) {
       step = { change: e, command: i, forward: true };
     }
     steps.push(step);
-    if ((i + 1) % PERIOD === 0) checkpoints.push(drawing.frame());
+    if ((i + 1) % period === 0) checkpoints.push(drawing.frame());
   }
   return { steps, lastActivation, checkpoints, final: drawing.frame() };
 }
@@ -231,13 +263,16 @@ export class PlaybackTimeline {
   readonly final: PlayerFrame;
   readonly density: number[];
   private readonly index;
+  private readonly period: number;
   private readonly strokes;
   private hiddenCheckpoints: PlayerFrame[] | null = null;
   private cache: { count: number; showUndone: boolean; frame: PlayerFrame } | null = null;
 
   constructor(readonly file: DrawRecording) {
     const initial = initialFrame(file);
-    this.index = indexActions(file.events, initial);
+    // With both histories cached, at most 48 distinct keyframe stroke lists per layer per history.
+    this.period = Math.max(128, Math.ceil(file.events.length / 48));
+    this.index = indexActions(file.events, initial, this.period);
     this.final = this.index.final;
     this.density = new Array<number>(64).fill(0);
     let last = 0;
@@ -273,7 +308,7 @@ export class PlaybackTimeline {
     for (let i = 0; i < this.index.steps.length; i++) {
       const change = this.included(i, false);
       if (change) drawing.apply(change);
-      if ((i + 1) % PERIOD === 0) checkpoints.push(drawing.frame());
+      if ((i + 1) % this.period === 0) checkpoints.push(drawing.frame());
     }
     this.hiddenCheckpoints = checkpoints;
     return checkpoints;
@@ -285,8 +320,8 @@ export class PlaybackTimeline {
 
   frame(at: number, showUndone: boolean, count = this.count(at)): PlayerFrame {
     const checkpoints = this.keyframes(showUndone);
-    const k = Math.floor(count / PERIOD);
-    let start = k * PERIOD;
+    const k = Math.floor(count / this.period);
+    let start = k * this.period;
     let base = checkpoints[k]!;
     if (this.cache?.showUndone === showUndone && this.cache.count >= start && this.cache.count <= count) {
       start = this.cache.count;

@@ -138,6 +138,7 @@ const {
   state: recordState,
 } = session;
 const { loaded: inPlayer, hideUi: cleanPlayer } = player;
+const recordingControlsBusy = computed(() => documentBusy.value || drawing.value || session.busy.value);
 Object.assign(window, { __draw: { open: session.open, play: player.play, seek: player.seek, pause: player.pause } });
 const hint = computed(() => ready.value && !error.value && strokeCount.value === 0 && !drawing.value);
 const lastStroke = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
@@ -969,7 +970,7 @@ onBeforeUnmount(() => {
             class="record-field"
           />
           <input v-model="recordAuthor" aria-label="Artist name" placeholder="Artist (optional)" class="record-field" />
-          <button id="record-start" class="item" :disabled="session.busy.value" @click="session.start">
+          <button id="record-start" class="item" :disabled="recordingControlsBusy" @click="session.start">
             <Icon name="record" :size="16" />{{
               recordState === "stopped" ? "Start a new recording" : "Start recording"
             }}
@@ -977,11 +978,21 @@ onBeforeUnmount(() => {
           <small v-if="recordState === 'stopped'">Starting again replaces the recording saved in Draw.</small>
         </template>
         <template v-else>
-          <button v-if="recordState === 'recording'" id="record-pause" class="item" @click="session.pause">
+          <button
+            v-if="recordState === 'recording'"
+            id="record-pause"
+            class="item"
+            :disabled="recordingControlsBusy"
+            @click="session.pause"
+          >
             Pause recording
           </button>
-          <button v-else id="record-resume" class="item" @click="session.resume">Resume recording</button>
-          <button id="record-stop" class="item" @click="session.stop">Stop recording</button>
+          <button v-else id="record-resume" class="item" :disabled="recordingControlsBusy" @click="session.resume">
+            Resume recording
+          </button>
+          <button id="record-stop" class="item" :disabled="recordingControlsBusy" @click="session.stop">
+            Stop recording
+          </button>
         </template>
         <i class="rule" />
         <button
@@ -998,12 +1009,18 @@ onBeforeUnmount(() => {
         <button
           id="record-save"
           class="item"
-          :disabled="recordState === 'idle' || session.busy.value"
+          :disabled="recordState === 'idle' || recordingControlsBusy"
           @click="session.save"
         >
           Save recording…
         </button>
-        <button v-if="recordState === 'stopped'" id="record-preview" class="item" @click="session.preview">
+        <button
+          v-if="recordState === 'stopped'"
+          id="record-preview"
+          class="item"
+          :disabled="recordingControlsBusy"
+          @click="session.preview"
+        >
           Play this recording
         </button>
         <button

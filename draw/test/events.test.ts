@@ -293,5 +293,5 @@ test("the initial layer and subsequent layer additions share the live layer limi
   }));
   const doc = await decodeRecording(joinBytes([...prefix(), await eventsChunk(events, 0)]));
   expect(new PlaybackTimeline({ ...doc, events: doc.events.slice(0, -1) }).final.layers).toHaveLength(LIMITS.layers);
-  expect(() => new PlaybackTimeline(doc)).toThrow("too many layers");
+  expect(() => new PlaybackTimeline(doc)).toThrow(`${LIMITS.layers} simultaneous layers`);
 });

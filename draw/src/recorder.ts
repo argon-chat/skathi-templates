@@ -3,6 +3,9 @@ import {
   endChunk,
   eventsChunk,
   joinBytes,
+  isProtectedHeader,
+  setProtection,
+  LayerTable,
   metaChunk,
   recordingHeader,
   snapshotChunk,
@@ -11,17 +14,22 @@ import {
   type DrawMeta,
   type DrawSnapshot,
 } from "./events";
+import type { JournalEdit } from "./recordingChanges";
 
 type Bytes = Uint8Array<ArrayBuffer>;
 type RecordedStroke = Extract<DrawAction, { kind: "stroke" }>;
-export type RecordingState = "idle" | "recording" | "paused" | "stopped";
+export type RecordingState = "idle" | "recording" | "paused" | "stopped" | "error";
 interface Session {
   revision: number;
+  generation: number;
+  documentRevision: number;
+  protected: boolean;
+  aliases?: [number, string][];
   chunks: number;
   count: number;
   last: number;
   elapsed: number;
-  state: Exclude<RecordingState, "idle">;
+  state: Exclude<RecordingState, "idle" | "error">;
 }
 interface Job {
   before: number;
@@ -29,11 +37,12 @@ interface Job {
   reset: boolean;
   parts: () => Promise<Bytes[]>;
   draft?: null | (() => Promise<Bytes>);
+  draftRevision?: number;
 }
 interface Prepared {
   job: Job;
   chunks: Bytes[];
-  draft: Bytes | null | undefined;
+  draft: { bytes: Bytes; revision: number } | null | undefined;
 }
 declare const requestIdleCallback: ((fn: () => void) => number) | undefined;
 declare const cancelIdleCallback: (id: number) => void;
@@ -47,7 +56,7 @@ function session(v: unknown): v is Session {
   if (typeof v !== "object" || v === null) return false;
   const s = v as Partial<Session>;
   return (
-    [s.revision, s.chunks, s.count, s.last, s.elapsed].every(
+    [s.revision, s.generation, s.documentRevision, s.chunks, s.count, s.last, s.elapsed].every(
       (n) => typeof n === "number" && Number.isSafeInteger(n) && n >= 0,
     ) &&
     (s.state === "recording" || s.state === "paused" || s.state === "stopped")
@@ -61,6 +70,7 @@ async function openJournal() {
   };
   return request(db);
 }
+class JournalConflict extends Error {}
 function persist(db: IDBDatabase, batch: readonly Prepared[]) {
   return new Promise<void>((resolve, reject) => {
     const tx = db.transaction(["session", "chunks"], "readwrite");
@@ -75,7 +85,7 @@ function persist(db: IDBDatabase, batch: readonly Prepared[]) {
         tx.abort();
         return;
       }
-      let latestDraft: Bytes | null | undefined;
+      let latestDraft: Prepared["draft"];
       for (const part of batch) {
         if (part.job.reset) chunks.clear();
         if (part.draft !== undefined) latestDraft = part.draft;
@@ -88,7 +98,11 @@ function persist(db: IDBDatabase, batch: readonly Prepared[]) {
     };
     tx.oncomplete = () => resolve();
     tx.onabort = () =>
-      reject(conflict ? new Error("The recording changed in another window. Reopen Draw to load it.") : tx.error);
+      reject(
+        conflict
+          ? new JournalConflict("Another window changed this recording. Retry to load the saved journal.")
+          : tx.error,
+      );
   });
 }
 
@@ -104,20 +118,37 @@ export class EventRecorder {
   private jobs: Job[] = [];
   private writing: Promise<void> | null = null;
   private failure: Error | null = null;
-  private protectedFlag = false;
+  private conflict = false;
+  private failedAt = 0;
+  private committed: Session | null = null;
+  private table = new LayerTable();
+  private documentRevision = 0;
   private hasDraft = false;
-  recoveredStroke: RecordedStroke | null = null;
+  private draft: { bytes: Bytes; revision: number } | null = null;
   metadata: DrawMeta | null = null;
-  constructor(private readonly onError?: (error: Error) => void) {}
+  constructor(
+    private readonly onError?: (error: Error) => void,
+    private readonly onCommit?: (generation: number, revision: number) => void,
+  ) {}
 
   get state(): RecordingState {
-    return this.head?.state ?? "idle";
+    return this.failure ? "error" : (this.head?.state ?? "idle");
   }
   get protected(): boolean {
-    return this.protectedFlag;
+    return this.head?.protected ?? false;
+  }
+  get error(): string {
+    return this.failure?.message ?? "";
+  }
+  get generation(): number {
+    return this.head?.generation ?? 0;
+  }
+  get savedDocumentRevision(): number {
+    return this.committed?.documentRevision ?? 0;
   }
   get elapsed(): number {
     if (!this.head) return 0;
+    if (this.failure) return this.failedAt;
     return this.head.state === "recording"
       ? Math.max(this.head.elapsed, Math.round(performance.now() - this.base))
       : this.head.elapsed;
@@ -132,6 +163,8 @@ export class EventRecorder {
         this.db = null;
         this.head = null;
         this.jobs = [];
+        this.failure = e instanceof Error ? e : new Error("Draw could not open the recording journal.");
+        this.conflict = true;
         throw e;
       })
       .finally(() => {
@@ -151,38 +184,79 @@ export class EventRecorder {
     ]);
     if (current !== undefined && !session(current)) throw new Error("Draw could not read the saved recording journal.");
     this.head = current ?? null;
+    this.committed = this.head;
+    this.documentRevision = this.head?.documentRevision ?? 0;
+    this.table = new LayerTable(this.head?.aliases);
     if (this.head && header instanceof Uint8Array && metadata instanceof Uint8Array) {
       this.metadata = (await decodeRecording(joinBytes([header, metadata]))).meta;
     }
-    this.protectedFlag = header instanceof Uint8Array && (header[8]! & 1) !== 0;
+    if (this.head && typeof this.head.protected !== "boolean" && header instanceof Uint8Array)
+      this.head.protected = isProtectedHeader(header);
     this.base = performance.now() - (this.head?.elapsed ?? 0);
     if (this.head?.state === "recording" && draft !== undefined) {
-      if (!(header instanceof Uint8Array && metadata instanceof Uint8Array && draft instanceof Uint8Array))
+      if (!(
+        typeof draft === "object" &&
+        draft &&
+        "bytes" in draft &&
+        draft.bytes instanceof Uint8Array &&
+        draft.bytes.buffer instanceof ArrayBuffer &&
+        "revision" in draft &&
+        typeof draft.revision === "number" &&
+        Number.isSafeInteger(draft.revision)
+      ))
         throw new Error("Draw could not read the interrupted stroke.");
-      const restored = await decodeRecording(joinBytes([header, metadata, draft]));
-      const stroke = restored.events[0];
-      if (stroke?.kind !== "stroke") throw new Error("Draw could not restore the interrupted stroke.");
-      this.recoveredStroke = { kind: "stroke", layer: stroke.layer, strokes: stroke.strokes };
       this.hasDraft = true;
-      this.batch.push({ ...this.recoveredStroke, at: Math.max(this.head.last, stroke.at) });
-      this.seal(undefined, null);
-      await this.drain();
+      this.draft = {
+        bytes: new Uint8Array(draft.bytes.buffer, draft.bytes.byteOffset, draft.bytes.byteLength),
+        revision: draft.revision,
+      };
     }
   }
 
-  async start(meta: DrawMeta, initial: DrawSnapshot | null, protectedFlag: boolean): Promise<void> {
+  async interruptedStroke(revision: number) {
+    const saved = this.draft;
+    this.draft = null;
+    if (!saved || this.state !== "recording") return null;
+    if (saved.revision !== revision) {
+      this.checkpoint(null);
+      return null;
+    }
+    const file = await decodeRecording(
+      joinBytes([recordingHeader(this.protected), metaChunk(this.metadata!), saved.bytes]),
+      this.table,
+    );
+    const stroke = file.events[0];
+    if (stroke?.kind !== "stroke") throw new Error("Draw could not restore the interrupted stroke.");
+    return stroke;
+  }
+
+  async readDocument() {
+    return decodeRecording(await this.bytes(), this.table);
+  }
+
+  async start(
+    meta: DrawMeta,
+    initial: DrawSnapshot | null,
+    protectedFlag: boolean,
+    documentRevision = 0,
+  ): Promise<void> {
     await this.recover();
+    if (this.failure) throw this.failure;
     if (this.state === "recording" || this.state === "paused")
       throw new Error("Stop the current recording before starting another.");
     const before = this.head?.revision ?? 0;
     const header = recordingHeader(protectedFlag);
-    this.protectedFlag = protectedFlag;
+    this.table = new LayerTable();
+    this.documentRevision = documentRevision;
     this.metadata = meta;
     this.hasDraft = false;
-    this.recoveredStroke = null;
+    this.draft = null;
     this.base = performance.now();
     const head: Session = {
       revision: before + 1,
+      generation: before + 1,
+      documentRevision,
+      protected: protectedFlag,
       chunks: initial ? 3 : 2,
       count: 0,
       last: 0,
@@ -197,16 +271,18 @@ export class EventRecorder {
       draft: null,
       parts: async () => {
         const parts = [header, metaChunk(meta)];
-        if (initial) parts.push(await snapshotChunk(initial));
+        if (initial) parts.push(await snapshotChunk(initial, this.table));
         return parts;
       },
     });
     await this.drain();
   }
 
-  record(action: DrawAction): void {
+  record(action: DrawAction, revision?: number, time = this.elapsed): void {
     if (this.state !== "recording") return;
-    const at = this.elapsed;
+    const at = Math.max(time, this.batch.at(-1)?.at ?? this.head?.last ?? 0);
+    if (at > this.elapsed) this.base = performance.now() - at;
+    if (revision !== undefined) this.documentRevision = revision;
     this.batch.push({ ...action, at });
     if (action.kind === "stroke") {
       this.seal(undefined, this.hasDraft ? null : undefined);
@@ -215,7 +291,7 @@ export class EventRecorder {
     }
   }
 
-  checkpoint(stroke: RecordedStroke | null): void {
+  checkpoint(stroke: RecordedStroke | null, documentRevision = this.documentRevision): void {
     if (this.state !== "recording") return;
     if (!stroke) {
       if (this.hasDraft) this.seal(undefined, null);
@@ -227,32 +303,38 @@ export class EventRecorder {
       .filter((s) => s.points.length)
       .map((s) => ({ stroke: { ...s }, length: s.points.length }));
     if (!prefixes.length) return;
-    this.seal(undefined, () =>
-      eventsChunk(
-        [
-          {
-            kind: "stroke",
-            layer: stroke.layer,
-            at,
-            strokes: prefixes.map(({ stroke: s, length }) => ({ ...s, points: s.points.slice(0, length) })),
-          },
-        ],
-        0,
-      ),
+    this.seal(
+      undefined,
+      () =>
+        eventsChunk(
+          [
+            {
+              kind: "stroke",
+              layer: stroke.layer,
+              at,
+              strokes: prefixes.map(({ stroke: s, length }) => ({ ...s, points: s.points.slice(0, length) })),
+            },
+          ],
+          0,
+          this.table,
+        ),
+      documentRevision,
     );
   }
 
-  private seal(state?: Session["state"], draft?: Job["draft"]) {
+  private seal(state?: Session["state"], draft?: Job["draft"], draftRevision?: number, force = false) {
     clearTimeout(this.timer);
     this.timer = undefined;
     const prev = this.head;
-    if (!prev || (!this.batch.length && !state && draft === undefined)) return;
+    if (this.failure || !prev || (!this.batch.length && !state && draft === undefined && !force)) return;
     if (state === "paused" || state === "stopped") draft = null;
     if (draft !== undefined) this.hasDraft = draft !== null;
     const batch = this.batch;
     this.batch = [];
-    const elapsed = this.elapsed;
+    const elapsed = Math.max(this.elapsed, batch.at(-1)?.at ?? prev.last);
     const head = {
+      ...prev,
+      documentRevision: this.documentRevision,
       revision: prev.revision + 1,
       chunks: prev.chunks + Number(batch.length > 0) + Number(state === "stopped"),
       count: prev.count + batch.length,
@@ -266,8 +348,9 @@ export class EventRecorder {
       head,
       reset: false,
       ...(draft !== undefined ? { draft } : {}),
+      ...(draftRevision !== undefined ? { draftRevision } : {}),
       parts: async () => {
-        const result = batch.length ? [await eventsChunk(batch, prev.last)] : [];
+        const result = batch.length ? [await eventsChunk(batch, prev.last, this.table)] : [];
         if (state === "stopped") result.push(endChunk(head.elapsed, head.count));
         return result;
       },
@@ -299,8 +382,8 @@ export class EventRecorder {
       this.idle = undefined;
     }
     if (this.writing) return this.writing;
+    if (this.failure) return Promise.reject(this.failure);
     if (!this.jobs.length) return Promise.resolve();
-    this.failure = null;
     const run = async () => {
       await Promise.resolve();
       try {
@@ -309,13 +392,18 @@ export class EventRecorder {
           const batch: Prepared[] = [];
           for (const job of this.jobs.slice(0, 16)) {
             const chunks = await job.parts();
-            const draft = job.draft ? await job.draft() : job.draft;
+            const draft = job.draft ? { bytes: await job.draft(), revision: job.draftRevision! } : job.draft;
+            job.head.aliases = this.table.entries();
             batch.push({ job, chunks, draft });
           }
           await persist(this.db, batch);
           this.jobs.splice(0, batch.length);
+          this.committed = batch.at(-1)!.job.head;
+          this.onCommit?.(this.committed.generation, this.committed.documentRevision);
         }
       } catch (cause: unknown) {
+        this.failedAt = this.elapsed;
+        this.conflict = cause instanceof JournalConflict;
         this.failure =
           cause instanceof Error
             ? cause
@@ -334,12 +422,49 @@ export class EventRecorder {
     this.seal(this.state === "recording" ? "recording" : undefined);
     await this.drain();
   }
+  async setProtected(value: boolean): Promise<void> {
+    if (!this.head || this.head.protected === value) return;
+    if (this.failure) throw this.failure;
+    this.head = { ...this.head, protected: value };
+    this.seal(undefined, undefined, undefined, true);
+    await this.drain();
+  }
+  fail(error: unknown) {
+    if (this.failure) return;
+    this.failedAt = this.elapsed;
+    this.failure = error instanceof Error ? error : new Error("Draw could not restore the recording.");
+    this.onError?.(this.failure);
+  }
+  async retry(): Promise<boolean> {
+    if (!this.failure) return false;
+    this.failure = null;
+    if (this.conflict) {
+      this.db?.close();
+      this.db = null;
+      this.head = null;
+      this.batch = [];
+      this.jobs = [];
+      this.draft = null;
+      this.hasDraft = false;
+      this.conflict = false;
+      await this.recover();
+      return true;
+    }
+    this.base = performance.now() - this.failedAt;
+    await this.drain();
+    return false;
+  }
   async pause(): Promise<void> {
     if (this.state === "recording") this.seal("paused");
     await this.drain();
   }
-  async resume(): Promise<void> {
+  async resume(edits: readonly JournalEdit[] = []): Promise<void> {
     if (this.state === "paused") {
+      const at = this.elapsed;
+      for (const edit of edits) {
+        this.batch.push({ ...edit.action, at });
+        this.documentRevision = edit.revision;
+      }
       this.base = performance.now() - this.elapsed;
       this.seal("recording");
     }
@@ -351,12 +476,20 @@ export class EventRecorder {
   }
   async bytes(protectedOverride?: boolean): Promise<Bytes> {
     if (!this.db || !this.head) throw new Error("Start a recording before saving.");
-    await this.flush();
+    this.seal();
+    await this.drain();
+    const revision = this.committed?.revision;
     const tx = this.db.transaction(["session", "chunks"]);
     const [stored, parts] = await Promise.all([
       request(tx.objectStore("session").get("current")),
       request(tx.objectStore("chunks").getAll()),
     ]);
+    if (session(stored) && stored.revision !== revision) {
+      const conflict = new JournalConflict("Another window changed this recording. Retry to load the saved journal.");
+      this.conflict = true;
+      this.fail(conflict);
+      throw conflict;
+    }
     if (
       !session(stored) ||
       stored.chunks !== parts.length ||
@@ -364,9 +497,9 @@ export class EventRecorder {
     ) {
       throw new Error("Draw could not read all saved recording chunks.");
     }
-    if (stored.state !== "stopped") parts.push(endChunk(stored.elapsed, stored.count));
+    if (stored.state !== "stopped") parts.push(endChunk(Math.max(stored.elapsed, this.elapsed), stored.count));
     const out = joinBytes(parts);
-    if (protectedOverride !== undefined) out[8] = (out[8]! & ~1) | Number(protectedOverride);
+    setProtection(out, protectedOverride ?? stored.protected);
     return out;
   }
 }
