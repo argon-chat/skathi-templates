@@ -1,31 +1,115 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch, type Ref } from "vue";
-import { LiveStroke, OneEuro, type Bounds } from "./ink";
-import { INK, PAPER, rgb, TOOL_INFO, type Color, type Stroke, type Tool } from "./model";
+import {
+  about,
+  type Affine,
+  apply,
+  type Bounds,
+  distanceToStroke,
+  IDENTITY,
+  insidePolygon,
+  isIdentity,
+  type Point,
+  rotate,
+  scale,
+  shapePath,
+  symmetryTransforms,
+  transformStroke,
+  translate,
+  union,
+} from "./geometry";
+import { LiveShape, LiveStroke, Stabilizer } from "./ink";
+import {
+  hex,
+  INK,
+  isTool,
+  PAPER,
+  rgb,
+  STRIDE,
+  type Color,
+  type Ink,
+  type Mode,
+  type Paper,
+  type Shape,
+  type Stroke,
+  type Symmetry,
+  type Tool,
+  type ToolSettings,
+} from "./model";
+import { Marks, type Rgba } from "./overlay";
 import { meshOf, Renderer, type View } from "./renderer";
 import type { useSketchbook } from "./sketchbook";
 
 const BARREL = 2;
 const ERASER = 32;
-const MIN_ZOOM = 0.1;
-const MAX_ZOOM = 8;
+const MIN_ZOOM = 0.05;
+const MAX_ZOOM = 16;
 const PALM_MS = 600;
+const SHAPE_PRESSURE = 0.76;
+const HANDLE_HIT = 11;
+
+const ACCENT: Rgba = [59, 130, 246, 255];
+const HALO: Rgba = [255, 255, 255, 220];
+const WHITE: Rgba = [255, 255, 255, 255];
+const CLEAR: Rgba = [0, 0, 0, 0];
+const GUIDE: Rgba = [59, 130, 246, 150];
 
 interface Options {
   canvas: Ref<HTMLCanvasElement | null>;
   book: ReturnType<typeof useSketchbook>;
-  tool: Ref<Tool>;
+  mode: Ref<Mode>;
   color: Ref<Color>;
-  width: (tool: Tool) => number;
+  settings: Record<Tool, ToolSettings>;
+  inkTool: Ref<Ink>;
+  shape: Ref<Shape>;
   dark: Ref<boolean>;
-  grid: Ref<boolean>;
+  paper: Ref<Paper>;
+  symmetry: Ref<Symmetry | null>;
+  onPick: (color: Color) => void;
 }
 
-type Gesture =
-  | { kind: "draw"; id: number; live: LiveStroke; fx: OneEuro; fy: OneEuro; fp: OneEuro; sx: number; sy: number }
-  | { kind: "pan"; id: number; x: number; y: number }
-  | { kind: "pinch"; distance: number; zoom: number; docX: number; docY: number };
+type Handle = "nw" | "n" | "ne" | "e" | "se" | "s" | "sw" | "w" | "rotate" | "move";
 
-const rgbUnit = (hex: string) => rgb(hex).map((c) => c / 255) as [number, number, number];
+type Gesture =
+  | { kind: "draw"; id: number; lives: LiveStroke[]; transforms: Affine[]; stab: Stabilizer; sx: number; sy: number }
+  | { kind: "shape"; id: number; start: Point; lives: LiveShape[]; transforms: Affine[] }
+  | { kind: "pan"; id: number; x: number; y: number }
+  | { kind: "pinch"; distance: number; angle: number; zoom: number; viewAngle: number; docX: number; docY: number }
+  | { kind: "lasso"; id: number; points: number[] }
+  | { kind: "transform"; id: number; handle: Handle; start: Point; m: Affine; moved: boolean }
+  | { kind: "pick"; id: number };
+
+interface Selection {
+  layer: string;
+  strokes: readonly Stroke[];
+  box: Bounds;
+}
+
+const rgbUnit = (h: string) => rgb(h).map((c) => c / 255) as [number, number, number];
+const CORNERS: Record<Exclude<Handle, "rotate" | "move">, [number, number]> = {
+  nw: [0, 0],
+  n: [0.5, 0],
+  ne: [1, 0],
+  e: [1, 0.5],
+  se: [1, 1],
+  s: [0.5, 1],
+  sw: [0, 1],
+  w: [0, 0.5],
+};
+const CURSORS: Record<Handle, string> = {
+  nw: "nwse-resize",
+  se: "nwse-resize",
+  ne: "nesw-resize",
+  sw: "nesw-resize",
+  n: "ns-resize",
+  s: "ns-resize",
+  e: "ew-resize",
+  w: "ew-resize",
+  rotate: "grab",
+  move: "move",
+};
+
+let clipboard: readonly Stroke[] = [];
+let pasted = 0;
 
 function penSeenBefore(): boolean {
   try {
@@ -36,137 +120,264 @@ function penSeenBefore(): boolean {
 }
 
 /** The drawing canvas: the WebGPU renderer, the view, and pen, mouse, touch and wheel input. */
-export function useSurface({ canvas, book, tool, color, width, dark, grid }: Options) {
+export function useSurface(o: Options) {
+  const { canvas, book, mode, color, settings } = o;
   const error = ref("");
   const ready = ref(false);
   const zoom = ref(1);
-  const zooming = ref(false);
-  const temporary = ref<Tool | null>(null);
+  const angle = ref(0);
+  const temporary = ref<Mode | null>(null);
   const drawing = ref(false);
   const panning = ref(false);
   const space = ref(false);
-  const effective = computed(() => temporary.value ?? tool.value);
+  const selected = ref(0);
+  const hover = ref<Handle | null>(null);
+  const effective = computed<Mode>(() => (space.value ? "hand" : (temporary.value ?? mode.value)));
+  const cursor = computed(() => {
+    if (panning.value) return "grabbing";
+    const m = effective.value;
+    if (m === "hand") return "grab";
+    if (m === "select" && hover.value) return CURSORS[hover.value];
+    return m === "eyedropper" ? "crosshair" : m === "select" ? "default" : "crosshair";
+  });
   let renderer: Renderer | null = null;
-  let view: View = { zoom: 1, x: 0, y: 0 };
+  let view: View = { zoom: 1, angle: 0, x: 0, y: 0 };
   let size = { w: 0, h: 0 };
   let gesture: Gesture | null = null;
-  let zoomTimer: ReturnType<typeof setTimeout> | undefined;
+  let selection: Selection | null = null;
   let penSeen = penSeenBefore();
   let penInRange = false;
   let lastPen = -Infinity;
+  let loupe: { x: number; y: number; color: Rgba | null } | null = null;
+  let picked: [number, number, number] | null = null;
+  let pickWant: Point | null = null;
+  let pickBusy = false;
+  let pickCommit = false;
   const touches = new Map<number, { x: number; y: number }>();
+  const marks = new Marks();
+  const viewListeners = new Set<() => void>();
 
-  const toDoc = (x: number, y: number) => ({ x: (x - view.x) / view.zoom, y: (y - view.y) / view.zoom });
+  function toDoc(x: number, y: number): Point {
+    const c = Math.cos(view.angle);
+    const s = Math.sin(view.angle);
+    const dx = x - view.x;
+    const dy = y - view.y;
+    return { x: (c * dx + s * dy) / view.zoom, y: (c * dy - s * dx) / view.zoom };
+  }
+
+  function toScreen(x: number, y: number): Point {
+    const c = Math.cos(view.angle) * view.zoom;
+    const s = Math.sin(view.angle) * view.zoom;
+    return { x: c * x - s * y + view.x, y: s * x + c * y + view.y };
+  }
+
+  /** The view that shows document point `doc` at screen point `at`. */
+  function placed(doc: Point, at: Point, z: number, a: number): View {
+    const c = Math.cos(a) * z;
+    const s = Math.sin(a) * z;
+    return { zoom: z, angle: a, x: at.x - (c * doc.x - s * doc.y), y: at.y - (s * doc.x + c * doc.y) };
+  }
 
   function setView(next: View) {
     view = next;
     renderer?.setView(view);
-    if (next.zoom !== zoom.value) {
-      zoom.value = next.zoom;
-      zooming.value = true;
-      clearTimeout(zoomTimer);
-      zoomTimer = setTimeout(() => (zooming.value = false), 1200);
-    }
+    if (next.zoom !== zoom.value) zoom.value = next.zoom;
+    const deg = Math.round(((((next.angle * 180) / Math.PI + 180) % 360) + 360) % 360) - 180;
+    if (deg !== angle.value) angle.value = deg;
+    for (const fn of viewListeners) fn();
   }
 
   function zoomAt(x: number, y: number, factor: number) {
     const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, view.zoom * factor));
-    const doc = toDoc(x, y);
-    setView({ zoom: z, x: x - doc.x * z, y: y - doc.y * z });
+    setView(placed(toDoc(x, y), { x, y }, z, view.angle));
   }
 
-  const zoomBy = (factor: number) => zoomAt(size.w / 2, size.h / 2, factor);
-  const resetZoom = () => zoomAt(size.w / 2, size.h / 2, 1 / view.zoom);
-  const home = () => setView({ zoom: 1, x: size.w / 2, y: size.h / 2 });
+  function rotateAt(x: number, y: number, a: number) {
+    setView(placed(toDoc(x, y), { x, y }, view.zoom, a));
+  }
 
-  /** Fits the drawing between the title strip and the toolbar, at 100% at most. */
+  const centre = () => ({ x: size.w / 2, y: size.h / 2 });
+  const zoomBy = (factor: number) => zoomAt(size.w / 2, size.h / 2, factor);
+  const zoomTo = (z: number) => zoomAt(size.w / 2, size.h / 2, z / view.zoom);
+  const rotateBy = (deg: number) => rotateAt(size.w / 2, size.h / 2, view.angle + (deg * Math.PI) / 180);
+  const resetRotation = () => rotateAt(size.w / 2, size.h / 2, 0);
+  const home = () => setView({ zoom: 1, angle: 0, x: size.w / 2, y: size.h / 2 });
+
+  /** Fits the drawing between the title strip and the toolbar, at 100% at most, keeping the rotation. */
   function fitContent() {
     const b = contentBounds();
     if (!b) return home();
     const top = 56;
-    const bottom = 108;
-    const z = Math.max(
-      MIN_ZOOM,
-      Math.min(1, (size.w - 64) / (b.maxX - b.minX), (size.h - top - bottom) / (b.maxY - b.minY)),
-    );
-    const cy = top + (size.h - top - bottom) / 2;
-    setView({ zoom: z, x: size.w / 2 - ((b.minX + b.maxX) / 2) * z, y: cy - ((b.minY + b.maxY) / 2) * z });
+    const bottom = 112;
+    const c = Math.cos(view.angle);
+    const s = Math.sin(view.angle);
+    const xs: number[] = [];
+    const ys: number[] = [];
+    for (const [x, y] of [
+      [b.minX, b.minY],
+      [b.maxX, b.minY],
+      [b.minX, b.maxY],
+      [b.maxX, b.maxY],
+    ] as const) {
+      xs.push(c * x - s * y);
+      ys.push(s * x + c * y);
+    }
+    const w = Math.max(...xs) - Math.min(...xs);
+    const h = Math.max(...ys) - Math.min(...ys);
+    const z = Math.max(MIN_ZOOM, Math.min(1, (size.w - 96) / w, (size.h - top - bottom) / h));
+    const mid = { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
+    setView(placed(mid, { x: size.w / 2, y: top + (size.h - top - bottom) / 2 }, z, view.angle));
+  }
+
+  function centreOn(x: number, y: number) {
+    setView(placed({ x, y }, centre(), view.zoom, view.angle));
   }
 
   function fit() {
     const w = innerWidth;
     const h = innerHeight;
     if (size.w) setView({ ...view, x: view.x + (w - size.w) / 2, y: view.y + (h - size.h) / 2 });
-    else setView({ zoom: 1, x: w / 2, y: h / 2 });
+    else setView({ zoom: 1, angle: 0, x: w / 2, y: h / 2 });
     size = { w, h };
     renderer?.resize(w, h, devicePixelRatio || 1);
   }
 
   function theme() {
-    const mode = dark.value ? "dark" : "light";
-    renderer?.setTheme(rgbUnit(PAPER[mode]), rgbUnit(INK[mode]), grid.value ? (dark.value ? 0.16 : 0.2) : 0);
+    const m = o.dark.value ? "dark" : "light";
+    renderer?.setTheme(rgbUnit(PAPER[m]), rgbUnit(INK[m]), o.paper.value, o.dark.value ? 0.16 : 0.2);
   }
 
   function ring(e: PointerEvent, on = true) {
     const t = effective.value;
-    const r = Math.max(2, (width(t) / 2) * view.zoom);
-    renderer?.setCursor(e.clientX, e.clientY, r, on && e.pointerType !== "touch" && !panning.value && !space.value);
+    const show = on && isTool(t) && e.pointerType !== "touch" && !panning.value;
+    const r = isTool(t) ? Math.max(2, (settings[t].size / 2) * view.zoom) : 0;
+    renderer?.setCursor(e.clientX, e.clientY, r, show);
   }
 
-  function startDraw(e: PointerEvent, t: Tool) {
+  function activeLayer() {
     const layer = book.layers.value.find((l) => l.id === book.active.value);
-    if (!layer?.visible || !renderer) return;
-    const stroke: Stroke = {
-      seq: book.nextSeq(),
-      tool: t,
-      color: t === "eraser" ? "ink" : color.value,
-      width: width(t),
-      points: [],
-    };
-    const live = new LiveStroke(stroke);
+    return layer?.visible ? layer : null;
+  }
+
+  const strokeOptions = (s: ToolSettings) => (s.opacity < 1 ? { opacity: s.opacity } : {});
+
+  function startDraw(e: PointerEvent, t: Tool) {
+    const layer = activeLayer();
+    if (!layer || !renderer) return;
+    const s = settings[t];
+    const transforms = symmetryTransforms(o.symmetry.value);
+    const lives = transforms.map(
+      () =>
+        new LiveStroke({
+          seq: book.nextSeq(),
+          tool: t,
+          color: t === "eraser" ? "ink" : color.value,
+          width: s.size,
+          points: [],
+          ...strokeOptions(s),
+        }),
+    );
     gesture = {
       kind: "draw",
       id: e.pointerId,
-      live,
-      fx: new OneEuro(6, 0.04),
-      fy: new OneEuro(6, 0.04),
-      fp: new OneEuro(4, 0.02),
+      lives,
+      transforms,
+      stab: new Stabilizer(s.streamline),
       sx: e.clientX,
       sy: e.clientY,
     };
     drawing.value = true;
     sample(e, true);
-    live.build([]);
-    renderer.beginLive(layer.id, live);
+    for (const live of lives) live.build([]);
+    renderer.beginLive(layer.id, lives);
   }
 
   function sample(e: PointerEvent, force = false) {
     if (gesture?.kind !== "draw") return;
     const g = gesture;
     const t = e.timeStamp;
-    const x = g.fx.filter(e.clientX, t);
-    const y = g.fy.filter(e.clientY, t);
-    const p = e.pointerType === "pen" ? g.fp.filter(e.pressure, t) : 0.5;
-    if (!force && Math.hypot(x - g.sx, y - g.sy) < 0.6) return;
-    g.sx = x;
-    g.sy = y;
-    const d = toDoc(x, y);
-    g.live.add(d.x, d.y, p, e.tiltX, e.tiltY, e.twist, t);
+    const p = e.pointerType === "pen" ? g.stab.pressure(e.pressure, t) : 0.5;
+    const at = g.stab.position(e.clientX, e.clientY, t);
+    if (!at || (!force && Math.hypot(at.x - g.sx, at.y - g.sy) < 0.6)) return;
+    g.sx = at.x;
+    g.sy = at.y;
+    const d = toDoc(at.x, at.y);
+    for (const [i, live] of g.lives.entries()) {
+      const q = apply(g.transforms[i]!, d.x, d.y);
+      live.add(q.x, q.y, p, e.tiltX, e.tiltY, e.twist, t);
+    }
   }
 
   function finishDraw(e: PointerEvent | null) {
     if (gesture?.kind !== "draw") return;
-    const { live } = gesture;
+    const { lives, transforms, stab } = gesture;
     gesture = null;
     drawing.value = false;
-    temporary.value = null;
+    if (temporary.value === "eraser") temporary.value = null;
     if (e) {
       const d = toDoc(e.clientX, e.clientY);
-      const pts = live.stroke.points;
-      const n = pts.length;
-      if (Math.hypot(d.x - pts[n - 7]!, d.y - pts[n - 6]!) * view.zoom > 0.3)
-        live.add(d.x, d.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp);
-      book.addStroke(live.stroke);
+      for (const [i, live] of lives.entries()) {
+        const pts = live.stroke.points;
+        const n = pts.length;
+        const q = apply(transforms[i]!, d.x, d.y);
+        if (!stab.trailing && Math.hypot(q.x - pts[n - 7]!, q.y - pts[n - 6]!) * view.zoom > 0.3)
+          live.add(q.x, q.y, pts[n - 5]!, e.tiltX, e.tiltY, e.twist, e.timeStamp);
+      }
+      book.addStrokes(lives.map((l) => l.stroke).filter((s) => s.points.length));
+      renderer?.setLayers(book.layers.value);
+    }
+    renderer?.endLive();
+  }
+
+  function startShape(e: PointerEvent) {
+    const layer = activeLayer();
+    if (!layer || !renderer) return;
+    const t = o.inkTool.value;
+    const s = settings[t];
+    const transforms = symmetryTransforms(o.symmetry.value);
+    const lives = transforms.map(
+      () =>
+        new LiveShape({
+          seq: book.nextSeq(),
+          tool: t,
+          color: color.value,
+          width: s.size,
+          points: [],
+          shape: true,
+          ...strokeOptions(s),
+        }),
+    );
+    gesture = { kind: "shape", id: e.pointerId, start: { x: e.clientX, y: e.clientY }, lives, transforms };
+    drawing.value = true;
+    renderer.beginLive(layer.id, lives);
+  }
+
+  function moveShape(e: PointerEvent) {
+    if (gesture?.kind !== "shape") return;
+    const g = gesture;
+    const width = g.lives[0]!.stroke.width * view.zoom;
+    const path = shapePath(o.shape.value, g.start, { x: e.clientX, y: e.clientY }, e.shiftKey, 14 + width * 2.5);
+    const doc = path.map((p) => toDoc(p.x, p.y));
+    for (const [i, live] of g.lives.entries()) {
+      const points: number[] = [];
+      for (const [k, p] of doc.entries()) {
+        const q = apply(g.transforms[i]!, p.x, p.y);
+        points.push(q.x, q.y, SHAPE_PRESSURE, 0, 0, 0, k);
+      }
+      live.set(points);
+    }
+    renderer?.updateLive();
+  }
+
+  function finishShape(e: PointerEvent | null) {
+    if (gesture?.kind !== "shape") return;
+    const g = gesture;
+    if (e) moveShape(e);
+    gesture = null;
+    drawing.value = false;
+    const far = e && Math.hypot(e.clientX - g.start.x, e.clientY - g.start.y) > 3;
+    if (far) {
+      book.addStrokes(g.lives.map((l) => l.stroke).filter((s) => s.points.length >= 2 * STRIDE));
       renderer?.setLayers(book.layers.value);
     }
     renderer?.endLive();
@@ -174,7 +385,25 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
 
   function pinchState() {
     const [a, b] = [...touches.values()] as [{ x: number; y: number }, { x: number; y: number }];
-    return { cx: (a.x + b.x) / 2, cy: (a.y + b.y) / 2, distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)) };
+    return {
+      cx: (a.x + b.x) / 2,
+      cy: (a.y + b.y) / 2,
+      distance: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)),
+      angle: Math.atan2(b.y - a.y, b.x - a.x),
+    };
+  }
+
+  function cancelGesture() {
+    if (gesture?.kind === "draw" || gesture?.kind === "shape") {
+      renderer?.endLive();
+      drawing.value = false;
+    }
+    if (gesture?.kind === "transform") {
+      renderer?.dropFloat();
+      renderer?.setLayers(book.layers.value);
+    }
+    gesture = null;
+    renderer?.invalidateOverlay();
   }
 
   function touchDown(e: PointerEvent) {
@@ -182,18 +411,29 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
     touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
     canvas.value?.setPointerCapture(e.pointerId);
     if (touches.size === 1) {
-      if (!penSeen) startDraw(e, tool.value);
+      if (!penSeen) press(e);
       else gesture = { kind: "pan", id: e.pointerId, x: e.clientX, y: e.clientY };
     } else if (touches.size === 2) {
-      if (gesture?.kind === "draw") {
-        gesture = null;
-        drawing.value = false;
-        renderer?.endLive();
-      }
-      const { cx, cy, distance } = pinchState();
+      cancelGesture();
+      const { cx, cy, distance, angle: a } = pinchState();
       const doc = toDoc(cx, cy);
-      gesture = { kind: "pinch", distance, zoom: view.zoom, docX: doc.x, docY: doc.y };
+      gesture = { kind: "pinch", distance, angle: a, zoom: view.zoom, viewAngle: view.angle, docX: doc.x, docY: doc.y };
     }
+  }
+
+  /** A primary press on the canvas, with whatever tool is in effect. */
+  function press(e: PointerEvent) {
+    const m = effective.value;
+    if (m === "hand") {
+      gesture = { kind: "pan", id: e.pointerId, x: e.clientX, y: e.clientY };
+      panning.value = true;
+      renderer?.setCursor(0, 0, 0, false);
+    } else if (m === "select") pressSelect(e);
+    else if (m === "shape") startShape(e);
+    else if (m === "eyedropper") {
+      gesture = { kind: "pick", id: e.pointerId };
+      requestPick(e.clientX, e.clientY);
+    } else startDraw(e, m);
   }
 
   function down(e: PointerEvent) {
@@ -210,20 +450,21 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
     if (e.pointerType === "touch") return touchDown(e);
     if (gesture) return;
     e.preventDefault();
-    if (e.button === 1 || (space.value && e.button === 0)) {
+    canvas.value?.setPointerCapture(e.pointerId);
+    if (e.button === 1) {
       gesture = { kind: "pan", id: e.pointerId, x: e.clientX, y: e.clientY };
       panning.value = true;
-      canvas.value?.setPointerCapture(e.pointerId);
       renderer?.setCursor(0, 0, 0, false);
       return;
     }
     const pen = e.pointerType === "pen";
     if (pen ? ![0, 2, 5].includes(e.button) : e.button !== 0) return;
     const erasing = pen && (e.button === 5 || e.button === 2 || (e.buttons & (ERASER | BARREL)) !== 0);
-    if (erasing) temporary.value = "eraser";
-    canvas.value?.setPointerCapture(e.pointerId);
-    startDraw(e, erasing ? "eraser" : tool.value);
-    if (gesture === null) temporary.value = null;
+    if (erasing && effective.value !== "hand") {
+      temporary.value = "eraser";
+      startDraw(e, "eraser");
+      if (gesture === null) temporary.value = null;
+    } else press(e);
     ring(e);
   }
 
@@ -238,29 +479,66 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
     }
     const g = gesture;
     if (g?.kind === "pinch") {
-      const { cx, cy, distance } = pinchState();
+      const { cx, cy, distance, angle: a } = pinchState();
       const z = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, (g.zoom * distance) / g.distance));
-      setView({ zoom: z, x: cx - g.docX * z, y: cy - g.docY * z });
+      let turn = g.viewAngle + a - g.angle;
+      const snapped = Math.round(turn / (Math.PI / 2)) * (Math.PI / 2);
+      if (Math.abs(turn - snapped) < 0.06) turn = snapped;
+      setView(placed({ x: g.docX, y: g.docY }, { x: cx, y: cy }, z, turn));
       return;
     }
-    if (g?.kind === "pan" && g.id === e.pointerId) {
-      setView({ ...view, x: view.x + e.clientX - g.x, y: view.y + e.clientY - g.y });
-      g.x = e.clientX;
-      g.y = e.clientY;
-      return;
-    }
-    if (g?.kind === "draw" && g.id === e.pointerId) {
-      const events = e.getCoalescedEvents();
-      for (const c of events.length ? events : [e]) sample(c);
-      g.live.build(
-        e.getPredictedEvents().map((p) => {
-          const d = toDoc(p.clientX, p.clientY);
-          return [d.x, d.y] as const;
-        }),
-      );
-      renderer?.updateLive();
+    if (g && "id" in g && g.id !== e.pointerId) return;
+    switch (g?.kind) {
+      case "pan":
+        setView({ ...view, x: view.x + e.clientX - g.x, y: view.y + e.clientY - g.y });
+        g.x = e.clientX;
+        g.y = e.clientY;
+        return;
+      case "draw": {
+        const events = e.getCoalescedEvents();
+        for (const c of events.length ? events : [e]) sample(c);
+        const predicted = g.stab.trailing ? [] : e.getPredictedEvents().map((p) => toDoc(p.clientX, p.clientY));
+        for (const [i, live] of g.lives.entries())
+          live.build(
+            predicted.map((p) => {
+              const q = apply(g.transforms[i]!, p.x, p.y);
+              return [q.x, q.y] as const;
+            }),
+          );
+        renderer?.updateLive();
+        break;
+      }
+      case "shape":
+        moveShape(e);
+        break;
+      case "lasso": {
+        const n = g.points.length;
+        if (Math.hypot(e.clientX - g.points[n - 2]!, e.clientY - g.points[n - 1]!) >= 3) {
+          g.points.push(e.clientX, e.clientY);
+          renderer?.invalidateOverlay();
+        }
+        return;
+      }
+      case "transform":
+        moveTransform(e, g);
+        return;
+      case "pick":
+        requestPick(e.clientX, e.clientY);
+        return;
+      default:
+        hovered(e);
     }
     ring(e);
+  }
+
+  function hovered(e: PointerEvent) {
+    const m = effective.value;
+    hover.value = m === "select" ? handleAt(e.clientX, e.clientY) : null;
+    if (m === "eyedropper" && e.pointerType !== "touch") requestPick(e.clientX, e.clientY);
+    else if (loupe) {
+      loupe = null;
+      renderer?.invalidateOverlay();
+    }
   }
 
   function up(e: PointerEvent) {
@@ -273,16 +551,47 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
         return;
       }
     }
-    if (gesture?.kind === "draw" && gesture.id === e.pointerId) finishDraw(e.type === "pointercancel" ? null : e);
-    else if (gesture?.kind === "pan" && gesture.id === e.pointerId) {
-      gesture = null;
-      panning.value = false;
+    const g = gesture;
+    if (!g || g.kind === "pinch" || g.id !== e.pointerId) return;
+    const cancelled = e.type === "pointercancel";
+    switch (g.kind) {
+      case "draw":
+        return finishDraw(cancelled ? null : e);
+      case "shape":
+        return finishShape(cancelled ? null : e);
+      case "pan":
+        gesture = null;
+        panning.value = false;
+        return;
+      case "lasso":
+        gesture = null;
+        if (!cancelled) finishLasso(g.points);
+        renderer?.invalidateOverlay();
+        return;
+      case "transform":
+        gesture = null;
+        if (cancelled) cancelGesture();
+        else commitTransform(g.m, g.moved);
+        return;
+      case "pick":
+        gesture = null;
+        if (!cancelled) {
+          pickCommit = true;
+          requestPick(e.clientX, e.clientY);
+        }
+        return;
     }
   }
 
   function leave(e: PointerEvent) {
     if (e.pointerType === "pen") penInRange = false;
-    if (!gesture) ring(e, false);
+    if (!gesture) {
+      ring(e, false);
+      if (loupe) {
+        loupe = null;
+        renderer?.invalidateOverlay();
+      }
+    }
   }
 
   function wheel(e: WheelEvent) {
@@ -295,37 +604,343 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
     else setView({ ...view, x: view.x - dx, y: view.y - dy });
   }
 
-  /** The drawn area of the visible layers, in document units. */
-  function contentBounds(): Bounds | null {
-    const b = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
-    for (const layer of book.layers.value) {
-      if (!layer.visible) continue;
-      for (const stroke of layer.strokes) {
-        if (stroke.tool === "eraser") continue;
-        const m = meshOf(stroke).bounds;
-        b.minX = Math.min(b.minX, m.minX);
-        b.minY = Math.min(b.minY, m.minY);
-        b.maxX = Math.max(b.maxX, m.maxX);
-        b.maxY = Math.max(b.maxY, m.maxY);
-      }
-    }
-    return Number.isFinite(b.minX) ? b : null;
+  function requestPick(x: number, y: number) {
+    pickWant = { x, y };
+    loupe = { x, y, color: loupe?.color ?? null };
+    renderer?.invalidateOverlay();
+    if (!pickBusy) void runPick();
   }
 
-  async function exportPng(): Promise<Blob | null> {
+  async function runPick() {
+    pickBusy = true;
+    try {
+      while (pickWant && renderer) {
+        const at = pickWant;
+        pickWant = null;
+        const d = toDoc(at.x, at.y);
+        picked = await renderer.pick(d.x, d.y);
+        if (loupe) {
+          loupe = { ...loupe, color: [...picked, 255] };
+          renderer?.invalidateOverlay();
+        }
+      }
+    } catch {
+      picked = null;
+    } finally {
+      pickBusy = false;
+    }
+    if (pickCommit && picked) o.onPick(hex(...picked));
+    pickCommit = false;
+  }
+
+  function strokesBounds(strokes: readonly Stroke[]): Bounds {
+    let b: Bounds | null = null;
+    for (const s of strokes) b = union(b, meshOf(s).bounds);
+    return b ?? { minX: 0, minY: 0, maxX: 0, maxY: 0 };
+  }
+
+  function select(layer: string, strokes: readonly Stroke[]) {
+    selection = strokes.length ? { layer, strokes, box: strokesBounds(strokes) } : null;
+    selected.value = strokes.length;
+    renderer?.invalidateOverlay();
+  }
+
+  function clearSelection() {
+    if (gesture?.kind === "transform" || gesture?.kind === "lasso") cancelGesture();
+    select("", []);
+  }
+
+  function finishLasso(points: number[]) {
+    const layer = activeLayer();
+    if (!layer) return select("", []);
+    let length = 0;
+    for (let i = 2; i < points.length; i += 2)
+      length += Math.hypot(points[i]! - points[i - 2]!, points[i + 1]! - points[i - 1]!);
+    if (length < 8) {
+      const d = toDoc(points[0]!, points[1]!);
+      const hit = [...layer.strokes]
+        .reverse()
+        .find((s) => s.tool !== "eraser" && distanceToStroke(s, d.x, d.y) <= (s.width / 2 + 6 / view.zoom) ** 2);
+      return select(layer.id, hit ? [hit] : []);
+    }
+    const poly: number[] = [];
+    for (let i = 0; i < points.length; i += 2) {
+      const d = toDoc(points[i]!, points[i + 1]!);
+      poly.push(d.x, d.y);
+    }
+    const inside = layer.strokes.filter((s) => {
+      let n = 0;
+      for (let i = 0; i < s.points.length; i += STRIDE) if (insidePolygon(s.points[i]!, s.points[i + 1]!, poly)) n++;
+      return n * 2 * STRIDE >= s.points.length;
+    });
+    select(layer.id, inside);
+  }
+
+  /** The selection's frame and handles on screen, through the transform being dragged. */
+  function frame(m: Affine) {
+    const s = selection!;
+    const pad = 6 / view.zoom;
+    const b = { minX: s.box.minX - pad, minY: s.box.minY - pad, maxX: s.box.maxX + pad, maxY: s.box.maxY + pad };
+    const at = (u: number, v: number) => {
+      const p = apply(m, b.minX + (b.maxX - b.minX) * u, b.minY + (b.maxY - b.minY) * v);
+      return toScreen(p.x, p.y);
+    };
+    const corners = [at(0, 0), at(1, 0), at(1, 1), at(0, 1)];
+    const [nw, ne, , sw] = corners as [Point, Point, Point, Point];
+    // Side handles on a short side would sit on top of the strokes, where a press should move them.
+    const sides = Math.min(Math.hypot(ne.x - nw.x, ne.y - nw.y), Math.hypot(sw.x - nw.x, sw.y - nw.y)) >= 56;
+    const handles = Object.entries(CORNERS)
+      .filter(([h]) => sides || h.length === 2)
+      .map(([h, [u, v]]) => ({ h: h as Handle, ...at(u, v) }));
+    const top = at(0.5, 0);
+    const mid = at(0.5, 0.5);
+    const len = Math.hypot(top.x - mid.x, top.y - mid.y) || 1;
+    const knob = { x: top.x + ((top.x - mid.x) / len) * 26, y: top.y + ((top.y - mid.y) / len) * 26 };
+    return { b, corners, handles, top, knob };
+  }
+
+  function handleAt(x: number, y: number): Handle | null {
+    if (!selection || selection.layer !== book.active.value) return null;
+    const f = frame(IDENTITY);
+    if (Math.hypot(f.knob.x - x, f.knob.y - y) <= HANDLE_HIT) return "rotate";
+    for (const h of f.handles) if (Math.hypot(h.x - x, h.y - y) <= HANDLE_HIT) return h.h;
+    return insidePolygon(
+      x,
+      y,
+      f.corners.flatMap((p) => [p.x, p.y]),
+    )
+      ? "move"
+      : null;
+  }
+
+  function pressSelect(e: PointerEvent) {
+    const handle = handleAt(e.clientX, e.clientY);
+    if (handle) {
+      gesture = {
+        kind: "transform",
+        id: e.pointerId,
+        handle,
+        start: toDoc(e.clientX, e.clientY),
+        m: IDENTITY,
+        moved: false,
+      };
+      return;
+    }
+    gesture = { kind: "lasso", id: e.pointerId, points: [e.clientX, e.clientY] };
+    renderer?.invalidateOverlay();
+  }
+
+  function moveTransform(e: PointerEvent, g: Extract<Gesture, { kind: "transform" }>) {
+    const s = selection;
+    if (!s || !renderer) return;
+    const p = toDoc(e.clientX, e.clientY);
+    const { b } = frame(IDENTITY);
+    const mid = { x: (b.minX + b.maxX) / 2, y: (b.minY + b.maxY) / 2 };
+    let m: Affine = IDENTITY;
+    if (g.handle === "move") {
+      let dx = p.x - g.start.x;
+      let dy = p.y - g.start.y;
+      if (e.shiftKey && Math.abs(dx) > Math.abs(dy)) dy = 0;
+      else if (e.shiftKey) dx = 0;
+      m = translate(dx, dy);
+    } else if (g.handle === "rotate") {
+      let a = Math.atan2(p.y - mid.y, p.x - mid.x) - Math.atan2(g.start.y - mid.y, g.start.x - mid.x);
+      if (e.shiftKey) a = Math.round(a / (Math.PI / 12)) * (Math.PI / 12);
+      m = about(mid.x, mid.y, rotate(a));
+    } else {
+      const [u, v] = CORNERS[g.handle];
+      const a = { x: b.minX + (b.maxX - b.minX) * (1 - u), y: b.minY + (b.maxY - b.minY) * (1 - v) };
+      const c = { x: b.minX + (b.maxX - b.minX) * u, y: b.minY + (b.maxY - b.minY) * v };
+      const ratio = (q: number, from: number, to: number) =>
+        Math.abs(to - from) > 1e-3 ? (q - from) / (to - from) : 1;
+      let sx = u === 0.5 ? 1 : ratio(p.x, a.x, c.x);
+      let sy = v === 0.5 ? 1 : ratio(p.y, a.y, c.y);
+      if (u !== 0.5 && v !== 0.5 && !e.shiftKey) {
+        const dx = c.x - a.x;
+        const dy = c.y - a.y;
+        sx = sy = ((p.x - a.x) * dx + (p.y - a.y) * dy) / Math.max(dx * dx + dy * dy, 1e-6);
+      }
+      m = about(a.x, a.y, scale(Math.max(0.02, sx), Math.max(0.02, sy)));
+    }
+    if (!g.moved && Math.hypot(p.x - g.start.x, p.y - g.start.y) * view.zoom < 2) return;
+    g.moved = true;
+    g.m = m;
+    renderer.setFloat(s.layer, s.strokes, m);
+    renderer.invalidateOverlay();
+  }
+
+  function commitTransform(m: Affine, moved: boolean) {
+    const s = selection;
+    renderer?.dropFloat();
+    if (!s || !moved || isIdentity(m)) {
+      renderer?.setLayers(book.layers.value);
+      renderer?.invalidateOverlay();
+      return;
+    }
+    const next = s.strokes.map((stroke) => transformStroke(stroke, m));
+    book.edit(s.layer, s.strokes, next);
+    renderer?.setLayers(book.layers.value);
+    select(s.layer, next);
+  }
+
+  function nudge(dx: number, dy: number) {
+    if (!selection) return false;
+    const c = Math.cos(-view.angle);
+    const s = Math.sin(-view.angle);
+    commitTransform(translate((c * dx - s * dy) / view.zoom, (s * dx + c * dy) / view.zoom), true);
+    return true;
+  }
+
+  function selectAll() {
+    const layer = activeLayer();
+    if (layer) select(layer.id, layer.strokes);
+  }
+
+  function deleteSelection() {
+    const s = selection;
+    if (!s) return false;
+    book.edit(s.layer, s.strokes, []);
+    select("", []);
+    return true;
+  }
+
+  function copySelection() {
+    if (!selection) return false;
+    clipboard = selection.strokes;
+    pasted = 0;
+    return true;
+  }
+
+  function cutSelection() {
+    return copySelection() && deleteSelection();
+  }
+
+  function place(strokes: readonly Stroke[], offset: number) {
+    const layer = activeLayer();
+    if (!layer || !strokes.length) return false;
+    const d = offset / view.zoom;
+    const copies = [...strokes]
+      .sort((a, b) => a.seq - b.seq)
+      .map((s) => transformStroke(s, translate(d, d), book.nextSeq()));
+    book.edit(layer.id, [], copies);
+    select(layer.id, copies);
+    return true;
+  }
+
+  const paste = () => place(clipboard, 16 * ++pasted);
+  const duplicateSelection = () => (selection ? place(selection.strokes, 16) : false);
+
+  function buildOverlay(): Uint8Array {
+    marks.reset();
+    const sym = o.symmetry.value;
+    if (sym) {
+      const c = toScreen(sym.x, sym.y);
+      const n = Math.max(1, Math.round(sym.segments));
+      const reach = Math.hypot(size.w, size.h) * 2;
+      for (let i = 0; i < n; i++) {
+        const a = -Math.PI / 2 + view.angle + (sym.mirror ? (i * Math.PI) / n : (i * 2 * Math.PI) / n);
+        const ex = c.x + Math.cos(a) * reach;
+        const ey = c.y + Math.sin(a) * reach;
+        const sx = sym.mirror ? c.x - Math.cos(a) * reach : c.x;
+        const sy = sym.mirror ? c.y - Math.sin(a) * reach : c.y;
+        marks.line(sx, sy, ex, ey, 1.25, GUIDE, 10);
+      }
+      marks.disc(c.x, c.y, 5, 1.5, ACCENT, WHITE);
+    }
+    if (gesture?.kind === "lasso" && gesture.points.length >= 4) {
+      marks.path(gesture.points, 3, HALO, 0, true);
+      marks.path(gesture.points, 1.5, ACCENT, 7, true);
+    }
+    if (selection && selection.layer === book.active.value) {
+      const m = gesture?.kind === "transform" ? gesture.m : IDENTITY;
+      const f = frame(m);
+      const ring = f.corners.flatMap((p) => [p.x, p.y]);
+      marks.path(ring, 3, HALO, 0, true);
+      marks.path(ring, 1.25, ACCENT, 0, true);
+      marks.line(f.top.x, f.top.y, f.knob.x, f.knob.y, 1.25, ACCENT);
+      for (const h of f.handles) marks.square(h.x, h.y, h.h.length === 2 ? 5 : 4, 1.5, ACCENT, WHITE);
+      marks.disc(f.knob.x, f.knob.y, 5.5, 1.5, ACCENT, WHITE);
+    }
+    if (loupe?.color) {
+      const outline: Rgba = o.dark.value ? [242, 242, 244, 200] : [28, 28, 30, 170];
+      marks.disc(loupe.x, loupe.y, 26, 10, loupe.color, CLEAR);
+      marks.disc(loupe.x, loupe.y, 27, 1.25, outline, CLEAR);
+      marks.disc(loupe.x, loupe.y, 16, 1.25, outline, CLEAR);
+      marks.disc(loupe.x, loupe.y, 1.5, 1.5, outline, CLEAR);
+    }
+    return marks.view();
+  }
+
+  /** The drawn area of the visible layers, in document units. */
+  function contentBounds(): Bounds | null {
+    let b: Bounds | null = null;
+    for (const layer of book.layers.value) {
+      if (!layer.visible) continue;
+      for (const stroke of layer.strokes) if (stroke.tool !== "eraser") b = union(b, meshOf(stroke).bounds);
+    }
+    return b;
+  }
+
+  async function exportPng(scaleBy: number, background: boolean, pattern: boolean): Promise<Blob | null> {
     const b = contentBounds();
     if (!b || !renderer) return null;
     const pad = 32;
-    return renderer.exportPng({ minX: b.minX - pad, minY: b.minY - pad, maxX: b.maxX + pad, maxY: b.maxY + pad }, 2);
+    const bounds = { minX: b.minX - pad, minY: b.minY - pad, maxX: b.maxX + pad, maxY: b.maxY + pad };
+    return renderer.exportPng(bounds, scaleBy, { background, pattern });
+  }
+
+  /** The document corners of the window, clockwise from the top left. */
+  const viewport = () => [toDoc(0, 0), toDoc(size.w, 0), toDoc(size.w, size.h), toDoc(0, size.h)];
+
+  /** A small picture of the drawing for the navigator, with the document area it covers. */
+  async function thumbnail(maxW: number, maxH: number) {
+    if (!renderer) return null;
+    let b = contentBounds();
+    if (!b) for (const p of viewport()) b = union(b, { minX: p.x, minY: p.y, maxX: p.x, maxY: p.y });
+    if (!b) return null;
+    const pad = Math.max(b.maxX - b.minX, b.maxY - b.minY) * 0.08 + 16;
+    let bounds = { minX: b.minX - pad, minY: b.minY - pad, maxX: b.maxX + pad, maxY: b.maxY + pad };
+    const s = Math.min(maxW / (bounds.maxX - bounds.minX), maxH / (bounds.maxY - bounds.minY));
+    const cx = (bounds.minX + bounds.maxX) / 2;
+    const cy = (bounds.minY + bounds.maxY) / 2;
+    bounds = { minX: cx - maxW / s / 2, maxX: cx + maxW / s / 2, minY: cy - maxH / s / 2, maxY: cy + maxH / s / 2 };
+    const image = await renderer.render(bounds, s, { background: true, pattern: false });
+    return { ...image, bounds, scale: s };
   }
 
   function setSpace(held: boolean) {
+    if (space.value === held) return;
     space.value = held;
+    hover.value = null;
     if (held) renderer?.setCursor(0, 0, 0, false);
   }
 
-  watch(book.layers, (layers) => renderer?.setLayers(layers));
-  watch([dark, grid], theme);
+  function setTemporary(m: Mode | null) {
+    if (gesture?.kind === "draw" || gesture?.kind === "shape") return;
+    temporary.value = m;
+    if (m !== "eyedropper" && loupe) {
+      loupe = null;
+      renderer?.invalidateOverlay();
+    }
+  }
+
+  watch(book.layers, (layers) => {
+    renderer?.setLayers(layers);
+    const s = selection;
+    if (!s) return;
+    const layer = layers.find((l) => l.id === s.layer);
+    const present = new Set(layer?.strokes);
+    if (!layer || s.strokes.some((x) => !present.has(x))) select("", []);
+  });
+  watch(book.active, () => {
+    if (selection) clearSelection();
+  });
+  watch(mode, (m) => {
+    if (m !== "select" && selection) clearSelection();
+    hover.value = null;
+  });
+  watch([o.dark, o.paper], theme);
+  watch(o.symmetry, () => renderer?.invalidateOverlay(), { deep: true });
 
   onMounted(async () => {
     const el = canvas.value;
@@ -336,6 +951,7 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
       error.value = e instanceof Error ? e.message : String(e);
       return;
     }
+    renderer.overlay = buildOverlay;
     size = { w: 0, h: 0 };
     fit();
     theme();
@@ -346,7 +962,6 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
 
   onBeforeUnmount(() => {
     removeEventListener("resize", fit);
-    clearTimeout(zoomTimer);
     renderer?.destroy();
     renderer = null;
   });
@@ -355,21 +970,43 @@ export function useSurface({ canvas, book, tool, color, width, dark, grid }: Opt
     ready,
     error,
     zoom,
-    zooming,
+    angle,
     drawing,
     panning,
     space,
     effective,
     temporary,
+    selected,
+    cursor,
     handlers: { down, move, up, leave, wheel },
     zoomBy,
-    resetZoom,
+    zoomTo,
+    rotateBy,
+    resetRotation,
     home,
     fitContent,
+    centreOn,
     setSpace,
+    setTemporary,
     exportPng,
+    thumbnail,
+    viewport,
+    onView(fn: () => void) {
+      viewListeners.add(fn);
+      return () => viewListeners.delete(fn);
+    },
+    centre: () => toDoc(size.w / 2, size.h / 2),
     hasContent: () => contentBounds() !== null,
+    bounds: contentBounds,
+    selection: () => selection,
+    clearSelection,
+    selectAll,
+    deleteSelection,
+    copySelection,
+    cutSelection,
+    paste,
+    duplicateSelection,
+    nudge,
+    canPaste: () => clipboard.length > 0,
   };
 }
-
-export const widthOf = (t: Tool, index: number) => TOOL_INFO[t].widths[index] ?? TOOL_INFO[t].widths[1];
