@@ -27,6 +27,7 @@ body {
   --pill: #1c1c1e;
   --pill-fill: #1c1c1ef5;
   --pill-border: #ffffff14;
+  --frame: #1c1c1e24;
 }
 #draw.dark {
   background: #1c1c1e;
@@ -34,6 +35,7 @@ body {
   --pill: #2a2a2d;
   --pill-fill: #2a2a2df5;
   --pill-border: #ffffff26;
+  --frame: #ffffff2e;
 }
 
 button {
@@ -82,6 +84,31 @@ button {
   padding: 0 2px;
   border-radius: 18px;
   app-region: no-drag;
+}
+
+.end {
+  display: flex;
+  gap: 8px;
+}
+
+.selection-bar {
+  position: absolute;
+  left: 50%;
+  top: 6px;
+  transform: translateX(-50%);
+  padding: 0 2px 0 14px;
+}
+.selection-bar .count {
+  font-size: 12px;
+  color: #f2f2f4d0;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.bar-rule {
+  width: 1px;
+  height: 18px;
+  margin: 0 6px 0 10px;
+  background: #ffffff1c;
 }
 
 .icon-button {
@@ -133,20 +160,131 @@ button {
   cursor: pointer;
   transition: background-color 150ms ease;
 }
-.text-button:hover {
+.text-button:hover:not(:disabled) {
   background: #ffffff17;
+}
+.text-button.small {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: #f2f2f4c0;
+}
+.text-button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.primary {
+  flex: 1;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: none;
+  border-radius: 10px;
+  background: #f2f2f4;
+  color: #1c1c1e;
+  font-weight: 600;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    opacity 150ms ease;
+}
+.primary:hover:not(:disabled) {
+  background: #ffffff;
+}
+.primary:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.primary:focus-visible,
+.seg:focus-visible {
+  outline: 2px solid #ffffffd0;
+  outline-offset: 1px;
+}
+
+.heading {
+  margin: 4px 10px 2px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #f2f2f473;
+}
+
+.segmented {
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border-radius: 11px;
+  background: #ffffff0d;
+}
+.seg {
+  flex: 1;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  color: #f2f2f4b3;
+  font-size: 12px;
+  cursor: pointer;
+  transition:
+    background-color 150ms ease,
+    color 150ms ease;
+}
+.seg:hover {
+  color: #f2f2f4;
+}
+.seg.on {
+  background: #ffffff26;
+  color: #ffffff;
+}
+.papers {
+  margin: 2px 4px 4px;
+}
+.papers .seg {
+  height: 34px;
+}
+
+kbd.shortcut {
+  margin-left: auto;
+  font: inherit;
+  font-size: 11.5px;
+  color: #f2f2f466;
+}
+
+.rotation {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px 4px 4px;
+}
+.degrees {
+  width: 44px;
+  text-align: center;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+.rotation .text-button {
+  margin-left: auto;
 }
 
 .icon-button:focus-visible,
 .text-button:focus-visible,
-.item:focus-visible,
-.zoom:focus-visible {
+.item:focus-visible {
   outline: 2px solid #ffffffd0;
   outline-offset: 1px;
 }
 
 .popover {
   position: absolute;
+  z-index: 2;
   border-radius: 16px;
   box-sizing: border-box;
 }
@@ -205,6 +343,14 @@ button {
   opacity: 0;
   transform: translateY(-4px) scale(0.98);
 }
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 160ms ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
 
 .hint {
   position: absolute;
@@ -223,23 +369,8 @@ button {
   opacity: 1;
 }
 
-.zoom {
-  position: absolute;
-  right: 16px;
-  bottom: 16px;
-  height: 32px;
-  padding: 0 12px;
-  border-radius: 16px;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-  cursor: pointer;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 200ms ease;
-}
-.zoom.shown {
-  opacity: 1;
-  pointer-events: auto;
+.view-menu {
+  width: 236px;
 }
 
 .notice {
@@ -256,6 +387,7 @@ button {
 
 .tip {
   position: absolute;
+  z-index: 4;
   transform: translate(-50%, -100%);
   display: flex;
   gap: 8px;
@@ -270,6 +402,9 @@ button {
 }
 .tip.below {
   transform: translate(-50%, 0);
+}
+.tip.right {
+  transform: translate(0, -50%);
 }
 .tip kbd {
   font: inherit;
@@ -304,9 +439,12 @@ button {
   .text-button,
   .item,
   .hint,
-  .zoom,
+  .seg,
+  .primary,
   .pop-enter-active,
-  .pop-leave-active {
+  .pop-leave-active,
+  .fade-enter-active,
+  .fade-leave-active {
     transition: none;
   }
 }

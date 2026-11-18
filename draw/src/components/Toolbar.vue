@@ -1,13 +1,21 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed } from "vue";
 import { SWATCHES, TOOL_INFO, TOOLS, type Color, type Tool } from "../model";
 import { hideTip, showTip } from "../tooltip";
 import ToolGlyph from "./ToolGlyph.vue";
 
-const props = defineProps<{ tool: Tool; color: Color; ink: string; width: number }>();
-const emit = defineEmits<{ tool: [Tool]; color: [Color]; width: [number] }>();
+const props = defineProps<{
+  tool: Tool | null;
+  color: Color;
+  ink: string;
+  /** The tool whose size and opacity the brush button shows. */
+  brushTool: Tool;
+  size: number;
+  opacity: number;
+  open: string | null;
+}>();
+const emit = defineEmits<{ tool: [Tool]; color: [Color]; brush: [Event]; palette: [Event] }>();
 
-const picker = ref<HTMLInputElement | null>(null);
 const hex = (c: Color) => (c === "ink" ? props.ink : c);
 const custom = computed(() => !SWATCHES.includes(props.color));
 const swatchNames: Record<string, string> = {
@@ -18,15 +26,12 @@ const swatchNames: Record<string, string> = {
   "#FFB020": "Amber",
   "#A06BFF": "Violet",
 };
-const widthNames = ["Fine", "Medium", "Bold"];
-
-function pick() {
-  hideTip();
-  const input = picker.value;
-  if (!input) return;
-  input.value = hex(props.color).toLowerCase();
-  input.showPicker();
-}
+const dot = computed(() => {
+  const { min, max } = TOOL_INFO[props.brushTool];
+  const u = Math.sqrt((props.size - min) / (max - min));
+  return Math.round(4 + Math.min(1, Math.max(0, u)) * 22);
+});
+const sizeText = computed(() => (props.size < 10 ? props.size.toFixed(1) : String(Math.round(props.size))));
 </script>
 
 <template>
@@ -70,48 +75,55 @@ function pick() {
           @blur="hideTip"
         />
       </div>
-      <button
-        id="swatch-custom"
-        class="swatch custom"
-        :class="{ selected: custom }"
-        aria-label="Custom colour"
-        @click="pick"
-        @pointerenter="showTip($event, 'Custom colour')"
-        @focus="showTip($event, 'Custom colour')"
-        @pointerleave="hideTip"
-        @blur="hideTip"
-      >
-        <span v-if="custom" class="custom-fill" :style="{ backgroundColor: color }" />
-      </button>
-      <input
-        ref="picker"
-        class="picker"
-        type="color"
-        tabindex="-1"
-        aria-hidden="true"
-        @input="emit('color', ($event.target as HTMLInputElement).value)"
-      />
+      <span class="anchor">
+        <button
+          id="swatch-custom"
+          class="swatch custom"
+          :class="{ selected: custom, open: open === 'palette' }"
+          aria-label="More colours"
+          :aria-expanded="open === 'palette'"
+          @click="emit('palette', $event)"
+          @pointerenter="showTip($event, 'More colours')"
+          @focus="showTip($event, 'More colours')"
+          @pointerleave="hideTip"
+          @blur="hideTip"
+        >
+          <span v-if="custom" class="custom-fill" :style="{ backgroundColor: color }" />
+        </button>
+      </span>
     </div>
     <i class="divider" />
-    <div class="widths" role="radiogroup" aria-label="Width">
+    <span class="anchor brush-anchor">
       <button
-        v-for="(name, i) in widthNames"
-        :key="name"
-        :id="`width-${i}`"
-        class="width"
-        :class="{ selected: i === width }"
-        role="radio"
-        :aria-checked="i === width"
-        :aria-label="`${name} width`"
-        @click="emit('width', i)"
-        @pointerenter="showTip($event, `${name}  [ or ]`)"
-        @focus="showTip($event, `${name}  [ or ]`)"
+        id="brush-settings"
+        class="brush"
+        :class="{ open: open === 'brush' }"
+        aria-label="Brush settings"
+        :aria-expanded="open === 'brush'"
+        @click="emit('brush', $event)"
+        @pointerenter="showTip($event, 'Size and opacity  [ ]  { }')"
+        @focus="showTip($event, 'Size and opacity  [ ]  { }')"
         @pointerleave="hideTip"
         @blur="hideTip"
       >
-        <span class="bar" :style="{ height: `${[2, 4.5, 8][i]}px` }" />
+        <span class="well">
+          <span
+            class="dot"
+            :class="{ eraser: brushTool === 'eraser' }"
+            :style="{
+              width: `${dot}px`,
+              height: `${dot}px`,
+              borderRadius: `${dot / 2}px`,
+              backgroundColor: brushTool === 'eraser' ? 'transparent' : hex(color),
+              opacity: brushTool === 'eraser' ? 1 : Math.max(0.15, opacity),
+            }"
+          />
+        </span>
+        <span class="caption"
+          >{{ sizeText }}<template v-if="opacity < 1"> · {{ Math.round(opacity * 100) }}%</template></span
+        >
       </button>
-    </div>
+    </span>
   </div>
 </template>
 
@@ -124,8 +136,8 @@ function pick() {
   height: 80px;
   display: flex;
   align-items: stretch;
-  padding: 0 18px;
-  gap: 18px;
+  padding: 0 14px 0 18px;
+  gap: 16px;
   border-radius: 22px;
   overflow: hidden;
 }
@@ -166,6 +178,10 @@ function pick() {
   align-items: center;
   gap: 10px;
 }
+.anchor {
+  display: flex;
+  align-items: center;
+}
 .swatches {
   display: grid;
   grid-template-columns: repeat(3, 28px);
@@ -201,57 +217,64 @@ function pick() {
   justify-content: center;
   background: conic-gradient(#ff5a52, #ffb020, #34c38f, #3b82f6, #a06bff, #ff5a52);
 }
+.custom.open {
+  transform: scale(1.08);
+}
 .custom-fill {
   width: 14px;
   height: 14px;
   border-radius: 7px;
   box-shadow: 0 0 0 2px var(--pill);
 }
-.picker {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  opacity: 0;
-  pointer-events: none;
+.brush-anchor {
+  align-self: center;
 }
-.widths {
-  width: 48px;
+.brush {
+  width: 56px;
+  height: 64px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 2px;
-}
-.width {
-  height: 24px;
-  display: flex;
   align-items: center;
   justify-content: center;
+  gap: 4px;
   padding: 0;
   border: none;
-  border-radius: 7px;
+  border-radius: 12px;
   background: transparent;
   cursor: pointer;
   transition: background-color 150ms ease;
 }
-.width:hover {
-  background: #ffffff0f;
+.brush:hover,
+.brush.open {
+  background: #ffffff14;
 }
-.width.selected {
-  background: #ffffff21;
-}
-.width:focus-visible {
+.brush:focus-visible {
   outline: 2px solid #ffffffd0;
   outline-offset: 1px;
 }
-.bar {
+.well {
   width: 30px;
-  border-radius: 4px;
-  background: #e8e8ea;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.dot {
+  box-shadow: 0 0 0 1px #ffffff2e;
+}
+.dot.eraser {
+  box-shadow: inset 0 0 0 1.5px #f2f2f4b0;
+}
+.caption {
+  font-size: 11px;
+  color: #f2f2f4a6;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 @media (prefers-reduced-motion: reduce) {
   .tool,
   .swatch,
-  .width {
+  .brush {
     transition: none;
   }
 }

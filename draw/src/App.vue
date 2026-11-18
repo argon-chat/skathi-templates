@@ -1,52 +1,110 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
 import { appWindow } from "@skathi-native/runtime";
+import BrushPopover from "./components/BrushPopover.vue";
+import ColorPopover from "./components/ColorPopover.vue";
+import ExportPopover, { type Format } from "./components/ExportPopover.vue";
 import Icon from "./components/Icon.vue";
 import LayersPopover from "./components/LayersPopover.vue";
+import Navigator from "./components/Navigator.vue";
+import ShapePopover from "./components/ShapePopover.vue";
+import ShortcutsSheet from "./components/ShortcutsSheet.vue";
+import SymmetryPopover from "./components/SymmetryPopover.vue";
 import Toolbar from "./components/Toolbar.vue";
-import { INK, TOOL_INFO, TOOLS, type Color, type Tool } from "./model";
+import ToolRail from "./components/ToolRail.vue";
+import ViewControls from "./components/ViewControls.vue";
+import WindowControls from "./components/WindowControls.vue";
+import {
+  clamp,
+  defaultSettings,
+  INK,
+  isColor,
+  isTool,
+  MODE_INFO,
+  PAPER,
+  PAPER_INFO,
+  PAPERS,
+  SHAPES,
+  SWATCHES,
+  TOOL_INFO,
+  TOOLS,
+  type Color,
+  type Ink,
+  type Mode,
+  type Paper,
+  type Shape,
+  type Symmetry,
+  type Tool,
+  type ToolSettings,
+} from "./model";
 import { poppyStudy } from "./sample";
 import { useSketchbook } from "./sketchbook";
-import { useSurface, widthOf } from "./surface";
+import { useSurface } from "./surface";
+import { toSvg } from "./svg";
 import { hideTip, showTip, tip } from "./tooltip";
+
+type Popover = "layers" | "menu" | "export" | "brush" | "palette" | "shape" | "symmetry" | "view";
 
 const scheme = matchMedia("(prefers-color-scheme: dark)");
 const dark = ref(scheme.matches);
-const grid = ref(readGrid());
-const tool = ref<Tool>("pen");
+const mode = ref<Mode>("pen");
+const lastTool = ref<Tool>("pen");
+const inkTool = ref<Ink>("pen");
 const color = ref<Color>("ink");
-const widths = reactive<Record<Tool, number>>({ pen: 1, brush: 1, marker: 1, pencil: 1, eraser: 1 });
+const recents = ref<Color[]>([]);
+const settings = reactive<Record<Tool, ToolSettings>>(defaultSettings());
+const shape = ref<Shape>("rect");
+const paper = ref<Paper>(legacyPaper());
+const symmetry = ref<Symmetry | null>(null);
+const lastSymmetry = ref<Symmetry>({ mirror: true, segments: 1, x: 0, y: 0 });
+const exportFormat = ref<Format>("png");
+const exportScale = ref(2);
+const exportPattern = ref(false);
+const navigatorOn = ref(false);
 const canvas = ref<HTMLCanvasElement | null>(null);
-const open = ref<"layers" | "menu" | null>(null);
+const open = ref<Popover | null>(null);
+const sheet = ref(false);
 const notice = ref("");
 const busy = ref(false);
-const placement = ref({ top: "50px", right: "8px" });
+const placement = shallowRef<Record<string, string>>({});
 const tipParts = computed(() => tip.value?.text.split("  ") ?? []);
 const book = useSketchbook();
 const { layers, active, ready, canUndo, canRedo, strokeCount } = book;
 const surface = useSurface({
   canvas,
   book,
-  tool,
+  mode,
   color,
-  width: (t) => widthOf(t, widths[t]),
+  settings,
+  inkTool,
+  shape,
   dark,
-  grid,
+  paper,
+  symmetry,
+  onPick: picked,
 });
-const { error, zoom, zooming, drawing, panning, space, effective, ready: drawable } = surface;
+const { error, angle, drawing, effective, selected, cursor, ready: drawable } = surface;
+const viewState = { zoom: surface.zoom, angle };
 const ink = computed(() => INK[dark.value ? "dark" : "light"]);
-const width = computed(() => widths[effective.value]);
+const brushTool = computed<Tool>(() => {
+  const m = effective.value;
+  return isTool(m) ? m : mode.value === "shape" ? inkTool.value : lastTool.value;
+});
 const hint = computed(() => ready.value && !error.value && strokeCount.value === 0 && !drawing.value);
-const cursor = computed(() => (panning.value ? "grabbing" : space.value ? "grab" : "crosshair"));
-const lastTool = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
-const caption = navigator.platform !== "MacIntel" && appWindow.chrome.titleBarStyle === "hidden";
+const lastStroke = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
+const caption = computed(
+  () => navigator.platform !== "MacIntel" && appWindow.chrome.titleBarStyle === "hidden" && !appWindow.isFullscreen(),
+);
+const navigatorVersion = computed(() => [layers.value, dark.value, paper.value]);
+const opacityStart = new Map<string, number>();
 let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+let prefsLoaded = false;
 
-function readGrid(): boolean {
+function legacyPaper(): Paper {
   try {
-    return localStorage.getItem("draw.grid") !== "0";
+    return localStorage.getItem("draw.grid") === "0" ? "plain" : "dots";
   } catch {
-    return true;
+    return "dots";
   }
 }
 
@@ -56,40 +114,93 @@ function notify(message: string) {
   noticeTimer = setTimeout(() => (notice.value = ""), 2600);
 }
 
-function chooseTool(t: Tool) {
-  tool.value = t;
+function setMode(m: Mode) {
+  if (m === "shape" && mode.value === "shape") {
+    shape.value = SHAPES[(SHAPES.indexOf(shape.value) + 1) % SHAPES.length]!;
+    return;
+  }
+  mode.value = m;
+  if (isTool(m)) {
+    lastTool.value = m;
+    if (m !== "eraser") inkTool.value = m;
+  }
+  if (open.value === "shape" || open.value === "brush") open.value = null;
+}
+
+function remember(c: Color) {
+  if (c === "ink" || SWATCHES.includes(c)) return;
+  recents.value = [c, ...recents.value.filter((r) => r.toUpperCase() !== c.toUpperCase())].slice(0, 12);
 }
 
 function chooseColor(c: Color) {
   color.value = c;
-  if (tool.value === "eraser") tool.value = "pen";
+  remember(c);
+  if (mode.value === "eraser" || mode.value === "eyedropper") setMode(inkTool.value);
 }
 
-function toggle(which: "layers" | "menu", event: Event) {
-  hideTip();
-  const box = (event.currentTarget as HTMLElement).closest(".anchor")?.getBoundingClientRect();
-  if (box) placement.value = { top: `${box.y + box.height + 8}px`, right: `${innerWidth - box.x - box.width}px` };
-  open.value = open.value === which ? null : which;
+function picked(c: Color) {
+  chooseColor(c);
+  notify(`Picked ${c}`);
 }
+
+function sampleColour() {
+  open.value = null;
+  setMode("eyedropper");
+}
+
+function place(event: Event | Element | null, side: "below" | "above" | "right", width: number) {
+  const el = event instanceof Element ? event : (event?.currentTarget as HTMLElement | null);
+  const box = el?.closest(".anchor")?.getBoundingClientRect() ?? el?.getBoundingClientRect();
+  if (!box) return;
+  if (side === "below")
+    placement.value = { top: `${box.y + box.height + 8}px`, right: `${innerWidth - box.x - box.width}px` };
+  else if (side === "right")
+    placement.value = { left: `${box.x + box.width + 10}px`, top: `${clamp(box.y - 4, 48, innerHeight - 320)}px` };
+  else {
+    const left = clamp(box.x + box.width / 2 - width / 2, 8, innerWidth - width - 8);
+    const top = el?.closest(".toolbar")?.getBoundingClientRect().y ?? box.y;
+    placement.value = { left: `${left}px`, bottom: `${innerHeight - top + 10}px` };
+  }
+}
+
+const SIDES: Record<Popover, ["below" | "above" | "right", number]> = {
+  layers: ["below", 280],
+  menu: ["below", 236],
+  export: ["below", 272],
+  brush: ["above", 272],
+  palette: ["above", 236],
+  shape: ["right", 300],
+  symmetry: ["right", 264],
+  view: ["above", 236],
+};
+
+function toggle(which: Popover, event: Event | Element | null) {
+  hideTip();
+  if (open.value === which) {
+    open.value = null;
+    return;
+  }
+  const [side, width] = SIDES[which];
+  place(event, side, width);
+  if (which === "view") {
+    const box = (event instanceof Element ? event : (event?.currentTarget as HTMLElement | null))
+      ?.closest(".anchor")
+      ?.getBoundingClientRect();
+    if (box)
+      placement.value = { right: `${innerWidth - box.x - box.width}px`, bottom: `${innerHeight - box.y + 10}px` };
+  }
+  open.value = which;
+}
+
+const openFrom = (id: string, which: Popover) => toggle(which, document.getElementById(id));
 
 function themeChange() {
   dark.value = scheme.matches;
 }
 
-function paintCaption() {
-  if (caption) appWindow.setTitleBarOverlay({ symbolColor: dark.value ? "#F2F2F4" : "#1C1C1E" });
-}
-
-function setGrid(on: boolean) {
-  grid.value = on;
-  try {
-    localStorage.setItem("draw.grid", on ? "1" : "0");
-  } catch {}
-}
-
 function newDrawing() {
   open.value = null;
-  book.replace([{ id: "layer-1", name: "Layer 1", visible: true, strokes: [] }]);
+  book.replace([{ id: "layer-1", name: "Layer 1", visible: true, opacity: 1, strokes: [] }]);
   surface.home();
 }
 
@@ -104,38 +215,95 @@ function clear() {
   book.clear();
 }
 
-async function image(copy: boolean) {
-  open.value = null;
+function setSymmetry(next: Symmetry | null) {
+  if (next && !symmetry.value) {
+    const c = surface.centre();
+    next = { ...next, x: c.x, y: c.y };
+  }
+  symmetry.value = next;
+  if (next) lastSymmetry.value = next;
+}
+
+function centreSymmetry() {
+  if (!symmetry.value) return;
+  const c = surface.centre();
+  setSymmetry({ ...symmetry.value, x: c.x, y: c.y });
+}
+
+function changeSettings(partial: Partial<ToolSettings>) {
+  Object.assign(settings[brushTool.value], partial);
+}
+
+function resetSettings() {
+  Object.assign(settings[brushTool.value], defaultSettings()[brushTool.value]);
+}
+
+function layerOpacity(id: string, value: number, final: boolean) {
+  if (!opacityStart.has(id)) opacityStart.set(id, layers.value.find((l) => l.id === id)?.opacity ?? 1);
+  if (!final) return book.previewOpacity(id, value);
+  book.setOpacity(id, opacityStart.get(id)!, value);
+  opacityStart.delete(id);
+}
+
+async function writeFile(handle: FileSystemFileHandle, blob: Blob) {
+  const writer = await handle.createWritable();
+  try {
+    await writer.write(blob);
+    await writer.close();
+  } catch (e) {
+    await writer.abort().catch(() => {});
+    throw e;
+  }
+}
+
+async function exportImage(action: "save" | "copy", format = exportFormat.value) {
   if (busy.value) return;
   if (!surface.hasContent()) {
     notify("Nothing to export yet");
     return;
   }
+  if (action === "copy" && format === "svg") format = "png";
   busy.value = true;
   try {
-    const target = copy
-      ? null
-      : await showSaveFilePicker({
-          id: "skathi-draw",
-          suggestedName: "Drawing.png",
-          types: [{ description: "PNG image", accept: { "image/png": [".png"] } }],
-        });
-    const blob = await surface.exportPng();
+    const svg = format === "svg";
+    const target =
+      action === "save"
+        ? await showSaveFilePicker({
+            id: "skathi-draw",
+            suggestedName: svg ? "Drawing.svg" : "Drawing.png",
+            types: [
+              svg
+                ? { description: "SVG image", accept: { "image/svg+xml": [".svg"] } }
+                : { description: "PNG image", accept: { "image/png": [".png"] } },
+            ],
+          })
+        : null;
+    const background = format !== "transparent";
+    const pattern = background && exportPattern.value && paper.value !== "plain";
+    let blob: Blob | null;
+    if (svg) {
+      const b = surface.bounds();
+      if (!b) return;
+      const mode = dark.value ? "dark" : "light";
+      const text = toSvg(layers.value, {
+        bounds: { minX: b.minX - 32, minY: b.minY - 32, maxX: b.maxX + 32, maxY: b.maxY + 32 },
+        ink: INK[mode],
+        paper: PAPER[mode],
+        background,
+        pattern: pattern ? paper.value : null,
+        patternOpacity: dark.value ? 0.16 : 0.2,
+      });
+      blob = new Blob([text], { type: "image/svg+xml" });
+    } else blob = await surface.exportPng(exportScale.value, background, pattern);
     if (!blob) return;
     if (target) {
-      const writer = await target.createWritable();
-      try {
-        await writer.write(blob);
-        await writer.close();
-      } catch (e) {
-        await writer.abort().catch(() => {});
-        throw e;
-      }
+      await writeFile(target, blob);
       notify(`Saved ${target.name}`);
     } else {
       await navigator.clipboard.write([new ClipboardItem({ "image/png": blob })]);
-      notify("Copied");
+      notify("Copied to the clipboard");
     }
+    open.value = null;
   } catch (e) {
     if ((e as { name?: unknown } | null)?.name !== "AbortError")
       notify(e instanceof Error ? e.message : "The image could not be made");
@@ -144,56 +312,176 @@ async function image(copy: boolean) {
   }
 }
 
+function selectionAction(action: "duplicate" | "copy" | "cut" | "delete" | "clear") {
+  if (action === "duplicate") surface.duplicateSelection();
+  else if (action === "copy" && surface.copySelection()) notify("Copied the selection");
+  else if (action === "cut") surface.cutSelection();
+  else if (action === "delete") surface.deleteSelection();
+  else surface.clearSelection();
+}
+
 function outside(e: PointerEvent) {
   const t = e.target as HTMLElement | null;
   if (open.value && !t?.closest?.(".popover, .anchor")) open.value = null;
 }
 
 function keydown(e: KeyboardEvent) {
-  if ((e.target as HTMLElement | null)?.tagName === "INPUT") return;
-  const key = e.key.toLowerCase();
+  const tag = (e.target as HTMLElement | null)?.tagName;
+  if (tag === "INPUT" || tag === "TEXTAREA") return;
+  const key = e.key;
+  const lower = key.toLowerCase();
+  if (sheet.value) {
+    if (key === "Escape" || key === "?") {
+      sheet.value = false;
+      e.preventDefault();
+    }
+    return;
+  }
   if (e.ctrlKey || e.metaKey) {
-    if (key === "z" && e.shiftKey) book.redo();
-    else if (key === "z") book.undo();
-    else if (key === "y") book.redo();
-    else if (key === "0") surface.resetZoom();
+    if (lower === "z" && e.shiftKey) book.redo();
+    else if (lower === "z") book.undo();
+    else if (lower === "y") book.redo();
+    else if (lower === "0") surface.zoomTo(1);
     else if (key === "=" || key === "+") surface.zoomBy(1.25);
     else if (key === "-") surface.zoomBy(0.8);
+    else if (lower === "a") {
+      setMode("select");
+      surface.selectAll();
+    } else if (lower === "c" && e.shiftKey) void exportImage("copy", "png");
+    else if (lower === "c") selectionAction("copy");
+    else if (lower === "x") selectionAction("cut");
+    else if (lower === "v" && surface.canPaste()) {
+      setMode("select");
+      surface.paste();
+    } else if (lower === "d") selectionAction("duplicate");
+    else if (lower === "n" && e.shiftKey) book.addLayer();
+    else if (lower === "e" && e.shiftKey) openFrom("export", "export");
     else return;
+    e.preventDefault();
+    return;
+  }
+  if (key === "Alt") {
+    if (!e.repeat) surface.setTemporary("eyedropper");
     e.preventDefault();
     return;
   }
   if (e.altKey) return;
   if (key === " ") {
-    if (!e.repeat) surface.setSpace(true);
+    surface.setSpace(true);
     e.preventDefault();
     return;
   }
-  if (key === "escape") {
-    open.value = null;
+  if (key === "Escape") {
+    if (open.value) open.value = null;
+    else surface.clearSelection();
     return;
   }
-  const picked = TOOLS.find((t, i) => key === String(i + 1) || key === TOOL_INFO[t].key.toLowerCase());
-  if (picked) tool.value = picked;
+  if ((key === "Delete" || key === "Backspace") && surface.deleteSelection()) {
+    e.preventDefault();
+    return;
+  }
+  if (key.startsWith("Arrow") && surface.selection()) {
+    const by = e.shiftKey ? 10 : 1;
+    const [dx, dy] = { ArrowLeft: [-by, 0], ArrowRight: [by, 0], ArrowUp: [0, -by], ArrowDown: [0, by] }[key] ?? [0, 0];
+    surface.nudge(dx!, dy!);
+    e.preventDefault();
+    return;
+  }
+  if (key === "?") sheet.value = true;
+  else if (e.shiftKey && (e.code === "Digit1" || key === "!")) surface.fitContent();
+  else if (e.shiftKey && lower === "n") navigatorOn.value = !navigatorOn.value;
   else if (key === "[" || key === "]") {
-    const t = tool.value;
-    widths[t] = Math.max(0, Math.min(2, widths[t] + (key === "]" ? 1 : -1)));
+    const t = brushTool.value;
+    const s = settings[t];
+    s.size = clamp(s.size * (key === "]" ? 1.15 : 1 / 1.15), TOOL_INFO[t].min, TOOL_INFO[t].max);
+  } else if (key === "{" || key === "}") {
+    const s = settings[brushTool.value];
+    s.opacity = clamp(Math.round((s.opacity + (key === "}" ? 0.1 : -0.1)) * 10) / 10, 0.1, 1);
+  } else if (key === "," || key === ".") surface.rotateBy(key === "," ? -15 : 15);
+  else if (lower === "r" && !e.shiftKey) surface.resetRotation();
+  else if (lower === "y" && !e.shiftKey) setSymmetry(symmetry.value ? null : lastSymmetry.value);
+  else if (lower === "g" && !e.shiftKey) paper.value = PAPERS[(PAPERS.indexOf(paper.value) + 1) % PAPERS.length]!;
+  else if (!e.shiftKey) {
+    const tool = TOOLS.find((t, i) => key === String(i + 1) || lower === TOOL_INFO[t].key.toLowerCase());
+    const other = (Object.keys(MODE_INFO) as (keyof typeof MODE_INFO)[]).find(
+      (m) => lower === MODE_INFO[m].key.toLowerCase(),
+    );
+    if (tool) setMode(tool);
+    else if (other) setMode(other);
+    else return;
   } else return;
   e.preventDefault();
 }
 
 function keyup(e: KeyboardEvent) {
   if (e.key === " ") surface.setSpace(false);
+  if (e.key === "Alt") surface.setTemporary(null);
 }
 
 function blur() {
   surface.setSpace(false);
+  surface.setTemporary(null);
 }
 
-watch(dark, paintCaption);
+const prefs = computed(() => ({
+  version: 1,
+  settings: JSON.parse(JSON.stringify(settings)) as unknown,
+  color: color.value,
+  recents: recents.value,
+  shape: shape.value,
+  paper: paper.value,
+  symmetry: symmetry.value,
+  lastSymmetry: lastSymmetry.value,
+  format: exportFormat.value,
+  scale: exportScale.value,
+  pattern: exportPattern.value,
+  navigator: navigatorOn.value,
+  mode: mode.value,
+  inkTool: inkTool.value,
+}));
+
+const record = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === "object";
+const number = (v: unknown, lo: number, hi: number): v is number => typeof v === "number" && v >= lo && v <= hi;
+
+function symmetryOf(v: unknown): Symmetry | null {
+  if (!record(v) || typeof v.mirror !== "boolean" || !number(v.segments, 1, 12)) return null;
+  if (typeof v.x !== "number" || typeof v.y !== "number" || !Number.isFinite(v.x + v.y)) return null;
+  return { mirror: v.mirror, segments: Math.round(v.segments), x: v.x, y: v.y };
+}
+
+function restore(p: unknown) {
+  if (!record(p) || p.version !== 1) return;
+  if (record(p.settings))
+    for (const t of TOOLS) {
+      const s = p.settings[t];
+      if (!record(s)) continue;
+      const info = TOOL_INFO[t];
+      if (number(s.size, info.min, info.max)) settings[t].size = s.size;
+      if (number(s.opacity, 0.05, 1)) settings[t].opacity = s.opacity;
+      if (number(s.streamline, 0, 1)) settings[t].streamline = s.streamline;
+    }
+  if (isColor(p.color)) color.value = p.color;
+  if (Array.isArray(p.recents)) recents.value = p.recents.filter(isColor).slice(0, 12);
+  if (SHAPES.includes(p.shape as Shape)) shape.value = p.shape as Shape;
+  if (PAPERS.includes(p.paper as Paper)) paper.value = p.paper as Paper;
+  symmetry.value = symmetryOf(p.symmetry);
+  lastSymmetry.value = symmetryOf(p.lastSymmetry) ?? lastSymmetry.value;
+  if (p.format === "png" || p.format === "transparent" || p.format === "svg") exportFormat.value = p.format;
+  if (p.scale === 1 || p.scale === 2 || p.scale === 4) exportScale.value = p.scale;
+  if (typeof p.pattern === "boolean") exportPattern.value = p.pattern;
+  if (typeof p.navigator === "boolean") navigatorOn.value = p.navigator;
+  if (isTool(p.inkTool) && p.inkTool !== "eraser") inkTool.value = p.inkTool;
+  if (isTool(p.mode)) setMode(p.mode);
+}
+
+watch(ready, (r) => {
+  if (!r || prefsLoaded) return;
+  prefsLoaded = true;
+  restore(book.prefs());
+});
+watch(prefs, (p) => prefsLoaded && book.savePrefs(p));
 
 onMounted(() => {
-  paintCaption();
   scheme.addEventListener("change", themeChange);
   addEventListener("keydown", keydown);
   addEventListener("keyup", keyup);
@@ -217,11 +505,15 @@ onBeforeUnmount(() => {
     :class="{ dark }"
     :data-ready="ready && drawable ? 'true' : 'false'"
     :data-strokes="strokeCount"
-    :data-tool="tool"
+    :data-tool="mode"
     :data-effective-tool="effective"
-    :data-last-tool="lastTool"
+    :data-last-tool="lastStroke"
     :data-layers="layers.length"
-    :data-zoom="zoom"
+    :data-active-layer="active"
+    :data-selected="selected"
+    :data-color="color"
+    :data-paper="paper"
+    :data-symmetry="symmetry ? (symmetry.segments > 1 ? `radial-${symmetry.segments}` : 'mirror') : 'off'"
   >
     <canvas
       ref="canvas"
@@ -272,37 +564,116 @@ onBeforeUnmount(() => {
           <Icon name="redo" />
         </button>
       </div>
-      <div class="cluster pill anchor">
-        <button
-          id="layers"
-          class="icon-button"
-          :class="{ on: open === 'layers' }"
-          aria-label="Layers"
-          :aria-expanded="open === 'layers'"
-          @click="toggle('layers', $event)"
-          @pointerenter="showTip($event, 'Layers', true)"
-          @focus="showTip($event, 'Layers', true)"
-          @pointerleave="hideTip"
-          @blur="hideTip"
+
+      <Transition name="fade">
+        <div
+          v-if="selected && effective === 'select'"
+          class="cluster pill selection-bar"
+          role="toolbar"
+          aria-label="Selection"
         >
-          <Icon name="layers" />
-        </button>
-        <button
-          id="menu"
-          class="icon-button"
-          :class="{ on: open === 'menu' }"
-          aria-label="More"
-          :aria-expanded="open === 'menu'"
-          @click="toggle('menu', $event)"
-          @pointerenter="showTip($event, 'More', true)"
-          @focus="showTip($event, 'More', true)"
-          @pointerleave="hideTip"
-          @blur="hideTip"
-        >
-          <Icon name="more" />
-        </button>
+          <span class="count">{{ selected }} selected</span>
+          <i class="bar-rule" />
+          <button
+            id="selection-duplicate"
+            class="icon-button"
+            aria-label="Duplicate"
+            @click="selectionAction('duplicate')"
+            @pointerenter="showTip($event, 'Duplicate  Ctrl+D', true)"
+            @pointerleave="hideTip"
+          >
+            <Icon name="copy" />
+          </button>
+          <button
+            id="selection-cut"
+            class="icon-button"
+            aria-label="Cut"
+            @click="selectionAction('cut')"
+            @pointerenter="showTip($event, 'Cut  Ctrl+X', true)"
+            @pointerleave="hideTip"
+          >
+            <Icon name="cut" />
+          </button>
+          <button
+            id="selection-delete"
+            class="icon-button"
+            aria-label="Delete"
+            @click="selectionAction('delete')"
+            @pointerenter="showTip($event, 'Delete  Del', true)"
+            @pointerleave="hideTip"
+          >
+            <Icon name="trash" />
+          </button>
+          <button
+            id="selection-clear"
+            class="icon-button"
+            aria-label="Deselect"
+            @click="selectionAction('clear')"
+            @pointerenter="showTip($event, 'Deselect  Esc', true)"
+            @pointerleave="hideTip"
+          >
+            <Icon name="close" />
+          </button>
+        </div>
+      </Transition>
+
+      <div class="end">
+        <div class="cluster pill anchor">
+          <button
+            id="export"
+            class="icon-button"
+            :class="{ on: open === 'export' }"
+            aria-label="Export"
+            :aria-expanded="open === 'export'"
+            @click="toggle('export', $event)"
+            @pointerenter="showTip($event, 'Export  Ctrl+Shift+E', true)"
+            @focus="showTip($event, 'Export  Ctrl+Shift+E', true)"
+            @pointerleave="hideTip"
+            @blur="hideTip"
+          >
+            <Icon name="export" />
+          </button>
+          <button
+            id="layers"
+            class="icon-button"
+            :class="{ on: open === 'layers' }"
+            aria-label="Layers"
+            :aria-expanded="open === 'layers'"
+            @click="toggle('layers', $event)"
+            @pointerenter="showTip($event, 'Layers', true)"
+            @focus="showTip($event, 'Layers', true)"
+            @pointerleave="hideTip"
+            @blur="hideTip"
+          >
+            <Icon name="layers" />
+          </button>
+          <button
+            id="menu"
+            class="icon-button"
+            :class="{ on: open === 'menu' }"
+            aria-label="More"
+            :aria-expanded="open === 'menu'"
+            @click="toggle('menu', $event)"
+            @pointerenter="showTip($event, 'More', true)"
+            @focus="showTip($event, 'More', true)"
+            @pointerleave="hideTip"
+            @blur="hideTip"
+          >
+            <Icon name="more" />
+          </button>
+        </div>
+        <WindowControls v-if="caption" />
       </div>
     </header>
+
+    <ToolRail
+      :mode="effective"
+      :shape="shape"
+      :symmetry="symmetry !== null"
+      :open="open"
+      @mode="setMode"
+      @flyout="(which, e) => toggle(which, e)"
+    />
 
     <Transition name="pop">
       <LayersPopover
@@ -313,9 +684,28 @@ onBeforeUnmount(() => {
         @select="book.selectLayer"
         @toggle="book.toggleLayer"
         @add="book.addLayer"
+        @duplicate="book.duplicateLayer"
+        @merge="book.mergeDown"
         @remove="book.deleteLayer"
         @move="book.moveLayer"
         @rename="book.renameLayer"
+        @opacity="layerOpacity"
+      />
+    </Transition>
+    <Transition name="pop">
+      <ExportPopover
+        v-if="open === 'export'"
+        :style="placement"
+        :format="exportFormat"
+        :scale="exportScale"
+        :pattern="exportPattern"
+        :paper="paper !== 'plain'"
+        :busy="busy"
+        @format="(f) => (exportFormat = f)"
+        @scale="(s) => (exportScale = s)"
+        @pattern="(p) => (exportPattern = p)"
+        @save="exportImage('save')"
+        @copy="exportImage('copy')"
       />
     </Transition>
     <Transition name="pop">
@@ -327,15 +717,27 @@ onBeforeUnmount(() => {
           <Icon name="flower" :size="16" />Load sample
         </button>
         <i class="rule" />
-        <button id="export-png" class="item" role="menuitem" :disabled="busy" @click="image(false)">
-          <Icon name="export" :size="16" />Export PNG…
-        </button>
-        <button id="copy-image" class="item" role="menuitem" :disabled="busy" @click="image(true)">
-          <Icon name="copy" :size="16" />Copy image
-        </button>
+        <p class="heading">Paper</p>
+        <div class="segmented papers" role="radiogroup" aria-label="Paper">
+          <button
+            v-for="p in PAPERS"
+            :id="`paper-${p}`"
+            :key="p"
+            class="seg"
+            :class="{ on: p === paper }"
+            role="radio"
+            :aria-checked="p === paper"
+            :aria-label="PAPER_INFO[p].name"
+            @click="paper = p"
+            @pointerenter="showTip($event, `${PAPER_INFO[p].name}  G`)"
+            @pointerleave="hideTip"
+          >
+            <Icon :name="p === 'dots' ? 'grid' : p" />
+          </button>
+        </div>
         <i class="rule" />
-        <button id="toggle-grid" class="item" role="menuitemcheckbox" :aria-checked="grid" @click="setGrid(!grid)">
-          <Icon name="grid" :size="16" />Show grid<Icon v-if="grid" class="check" name="check" :size="16" />
+        <button id="show-shortcuts" class="item" role="menuitem" @click="((open = null), (sheet = true))">
+          <Icon name="keyboard" :size="16" />Keyboard shortcuts<kbd class="shortcut">?</kbd>
         </button>
         <i class="rule" />
         <button id="clear" class="item danger" role="menuitem" :disabled="!strokeCount" @click="clear">
@@ -343,31 +745,128 @@ onBeforeUnmount(() => {
         </button>
       </div>
     </Transition>
+    <Transition name="pop">
+      <BrushPopover
+        v-if="open === 'brush'"
+        :style="placement"
+        :tool="brushTool"
+        :settings="settings[brushTool]"
+        :color="color === 'ink' ? ink : color"
+        :shape="mode === 'shape'"
+        @change="changeSettings"
+        @reset="resetSettings"
+      />
+    </Transition>
+    <Transition name="pop">
+      <ColorPopover
+        v-if="open === 'palette'"
+        :style="placement"
+        :color="color"
+        :ink="ink"
+        :recents="recents"
+        @color="chooseColor"
+        @eyedropper="sampleColour"
+      />
+    </Transition>
+    <Transition name="pop">
+      <ShapePopover
+        v-if="open === 'shape'"
+        :style="placement"
+        :shape="shape"
+        :ink="inkTool"
+        @shape="(s) => ((shape = s), (open = null))"
+      />
+    </Transition>
+    <Transition name="pop">
+      <SymmetryPopover
+        v-if="open === 'symmetry'"
+        :style="placement"
+        :symmetry="symmetry"
+        :last="lastSymmetry"
+        @change="setSymmetry"
+        @centre="centreSymmetry"
+      />
+    </Transition>
+    <Transition name="pop">
+      <div v-if="open === 'view'" class="popover pill menu view-menu" :style="placement" role="menu" aria-label="View">
+        <button id="zoom-actual" class="item" role="menuitem" @click="surface.zoomTo(1)">
+          <Icon name="page" :size="16" />Actual size<kbd class="shortcut">Ctrl+0</kbd>
+        </button>
+        <button id="zoom-fit" class="item" role="menuitem" @click="surface.fitContent()">
+          <Icon name="fit" :size="16" />Fit drawing<kbd class="shortcut">Shift+1</kbd>
+        </button>
+        <i class="rule" />
+        <p class="heading">Rotation</p>
+        <div class="rotation">
+          <button
+            id="rotate-left"
+            class="icon-button"
+            aria-label="Rotate left"
+            @click="surface.rotateBy(-15)"
+            @pointerenter="showTip($event, 'Rotate left  ,')"
+            @pointerleave="hideTip"
+          >
+            <Icon name="rotate-left" />
+          </button>
+          <span class="degrees">{{ angle }}°</span>
+          <button
+            id="rotate-right"
+            class="icon-button"
+            aria-label="Rotate right"
+            @click="surface.rotateBy(15)"
+            @pointerenter="showTip($event, 'Rotate right  .')"
+            @pointerleave="hideTip"
+          >
+            <Icon name="rotate-right" />
+          </button>
+          <button id="rotate-reset" class="text-button small" :disabled="!angle" @click="surface.resetRotation()">
+            <Icon name="compass" :size="16" />Reset
+          </button>
+        </div>
+      </div>
+    </Transition>
 
-    <p class="hint" :class="{ shown: hint }" aria-hidden="true">Draw anywhere. Pinch or Ctrl+scroll to zoom.</p>
+    <p class="hint" :class="{ shown: hint }" aria-hidden="true">
+      Draw anywhere. Pinch or Ctrl+scroll to zoom. Press ? for shortcuts.
+    </p>
 
     <Toolbar
-      :tool="effective"
+      :tool="isTool(effective) ? effective : null"
       :color="color"
       :ink="ink"
-      :width="width"
-      @tool="chooseTool"
+      :brush-tool="brushTool"
+      :size="settings[brushTool].size"
+      :opacity="settings[brushTool].opacity"
+      :open="open"
+      @tool="setMode"
       @color="chooseColor"
-      @width="(i) => (widths[tool] = i)"
+      @brush="(e) => toggle('brush', e)"
+      @palette="(e) => toggle('palette', e)"
     />
 
-    <button
-      class="zoom pill"
-      :class="{ shown: zooming }"
-      :aria-label="`Zoom ${Math.round(zoom * 100)}%, reset to 100%`"
-      @click="surface.resetZoom"
-    >
-      {{ Math.round(zoom * 100) }}%
-    </button>
+    <Navigator
+      v-if="navigatorOn && drawable"
+      :version="navigatorVersion"
+      :thumbnail="surface.thumbnail"
+      :viewport="surface.viewport"
+      :on-view="surface.onView"
+      @centre="surface.centreOn"
+    />
+    <ViewControls
+      :view="viewState"
+      :navigator="navigatorOn"
+      :open="open === 'view'"
+      @zoom-in="surface.zoomBy(1.25)"
+      @zoom-out="surface.zoomBy(0.8)"
+      @menu="(e) => toggle('view', e)"
+      @navigator="navigatorOn = !navigatorOn"
+    />
 
     <p v-if="notice" class="notice pill" role="status">{{ notice }}</p>
 
-    <div v-if="tip" class="tip" :class="{ below: tip.below }" :style="{ left: `${tip.x}px`, top: `${tip.y}px` }">
+    <ShortcutsSheet v-if="sheet" @close="sheet = false" />
+
+    <div v-if="tip" class="tip" :class="tip.place" :style="{ left: `${tip.x}px`, top: `${tip.y}px` }">
       <span>{{ tipParts[0] }}</span
       ><kbd v-if="tipParts[1]">{{ tipParts[1] }}</kbd>
     </div>
