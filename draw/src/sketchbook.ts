@@ -1,0 +1,364 @@
+import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
+import { appWindow } from "@skathi-native/runtime";
+import { isColor, STRIDE, TOOLS, type Layer, type Stroke, type Tool } from "./model";
+
+type Command =
+  | { kind: "stroke"; layer: string; stroke: Stroke }
+  | { kind: "add-layer"; layer: Layer; index: number }
+  | { kind: "delete-layer"; layer: Layer; index: number }
+  | { kind: "move-layer"; from: number; to: number }
+  | { kind: "rename-layer"; id: string; from: string; to: string }
+  | { kind: "replace"; before: readonly Layer[]; after: readonly Layer[] };
+
+type Write =
+  | { kind: "put"; layer: string; stroke: Stroke }
+  | { kind: "delete"; layer: string; seq: number }
+  | { kind: "drop"; layer: string }
+  | { kind: "wipe" };
+
+interface StrokeRecord extends Stroke {
+  layer: string;
+}
+
+interface DocumentRecord {
+  version: 1;
+  layers: { id: string; name: string; visible: boolean }[];
+  active: string;
+  seq: number;
+}
+
+const HISTORY = 200;
+
+function record(v: unknown): v is Record<string, unknown> {
+  return v !== null && typeof v === "object";
+}
+
+function strokeRecord(v: unknown): v is StrokeRecord {
+  return (
+    record(v) &&
+    typeof v.layer === "string" &&
+    Number.isInteger(v.seq) &&
+    TOOLS.includes(v.tool as Tool) &&
+    isColor(v.color) &&
+    typeof v.width === "number" &&
+    v.width > 0 &&
+    Array.isArray(v.points) &&
+    v.points.length > 0 &&
+    v.points.length % STRIDE === 0 &&
+    v.points.every(Number.isFinite)
+  );
+}
+
+function documentRecord(v: unknown): v is DocumentRecord {
+  return (
+    record(v) &&
+    v.version === 1 &&
+    typeof v.active === "string" &&
+    Number.isInteger(v.seq) &&
+    Array.isArray(v.layers) &&
+    v.layers.length > 0 &&
+    v.layers.every(
+      (l: unknown) =>
+        record(l) && typeof l.id === "string" && typeof l.name === "string" && typeof l.visible === "boolean",
+    )
+  );
+}
+
+const request = <T>(r: IDBRequest<T>) =>
+  new Promise<T>((resolve, reject) => {
+    r.onsuccess = () => resolve(r.result);
+    r.onerror = () => reject(r.error);
+  });
+
+function openBook(): Promise<IDBDatabase> {
+  const open = indexedDB.open("skathi-draw-ink", 1);
+  open.onupgradeneeded = () => {
+    open.result.createObjectStore("strokes");
+    open.result.createObjectStore("document");
+  };
+  return request(open);
+}
+
+const blank = (n: number): Layer => ({ id: `layer-${n}`, name: `Layer ${n}`, visible: true, strokes: [] });
+
+/** The drawing: its layers, undo history and an IndexedDB copy written a stroke at a time. */
+export function useSketchbook() {
+  const layers = shallowRef<readonly Layer[]>([blank(1)]);
+  const active = ref("layer-1");
+  const ready = ref(false);
+  const done = shallowRef<readonly Command[]>([]);
+  const undone = shallowRef<readonly Command[]>([]);
+  const canUndo = computed(() => done.value.length > 0);
+  const canRedo = computed(() => undone.value.length > 0);
+  const strokeCount = computed(() => layers.value.reduce((n, l) => n + l.strokes.length, 0));
+  let seq = 1;
+  let db: IDBDatabase | undefined;
+  let writes: Write[] = [];
+  let documentChanged = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let pending: Promise<boolean> | undefined;
+  let closed = false;
+  let closeAfterFailedRetry = false;
+
+  const index = (id: string) => layers.value.findIndex((l) => l.id === id);
+  const activeLayer = () => layers.value.find((l) => l.id === active.value);
+
+  function persist(write?: Write) {
+    if (write?.kind === "wipe") writes = [];
+    if (write) writes.push(write);
+    documentChanged = true;
+    clearTimeout(timer);
+    timer = setTimeout(() => void flush(), 400);
+  }
+
+  async function flush(): Promise<boolean> {
+    clearTimeout(timer);
+    while (pending) await pending;
+    if (!documentChanged || !db) return !documentChanged;
+    const batch = writes;
+    const doc: DocumentRecord = {
+      version: 1,
+      layers: layers.value.map(({ id, name, visible }) => ({ id, name, visible })),
+      active: active.value,
+      seq,
+    };
+    writes = [];
+    documentChanged = false;
+    const database = db;
+    const write = new Promise<void>((resolve, reject) => {
+      const tx = database.transaction(["strokes", "document"], "readwrite");
+      tx.oncomplete = () => resolve();
+      tx.onabort = () => reject(tx.error);
+      const strokes = tx.objectStore("strokes");
+      for (const w of batch) {
+        if (w.kind === "wipe") strokes.clear();
+        else if (w.kind === "put") strokes.put({ ...w.stroke, layer: w.layer }, [w.layer, w.stroke.seq]);
+        else if (w.kind === "delete") strokes.delete([w.layer, w.seq]);
+        else strokes.delete(IDBKeyRange.bound([w.layer, -Infinity], [w.layer, Infinity]));
+      }
+      tx.objectStore("document").put(doc, "current");
+    }).then(
+      () => true,
+      () => {
+        writes = [...batch, ...writes];
+        documentChanged = true;
+        return false;
+      },
+    );
+    pending = write;
+    const ok = await write;
+    if (pending === write) pending = undefined;
+    return ok;
+  }
+
+  function setLayers(next: readonly Layer[]) {
+    layers.value = next;
+    if (!next.some((l) => l.id === active.value)) active.value = next.at(-1)?.id ?? "";
+  }
+
+  function apply(c: Command, forward: boolean) {
+    const list = [...layers.value];
+    switch (c.kind) {
+      case "stroke": {
+        const i = index(c.layer);
+        const layer = list[i];
+        if (!layer) return;
+        list[i] = {
+          ...layer,
+          strokes: forward ? [...layer.strokes, c.stroke] : layer.strokes.filter((s) => s !== c.stroke),
+        };
+        persist(
+          forward
+            ? { kind: "put", layer: c.layer, stroke: c.stroke }
+            : { kind: "delete", layer: c.layer, seq: c.stroke.seq },
+        );
+        break;
+      }
+      case "add-layer":
+      case "delete-layer": {
+        const adding = (c.kind === "add-layer") === forward;
+        if (adding) {
+          list.splice(c.index, 0, c.layer);
+          active.value = c.layer.id;
+          for (const stroke of c.layer.strokes) persist({ kind: "put", layer: c.layer.id, stroke });
+        } else {
+          list.splice(c.index, 1);
+          if (active.value === c.layer.id) active.value = list[Math.max(0, c.index - 1)]?.id ?? "";
+          persist({ kind: "drop", layer: c.layer.id });
+        }
+        persist();
+        break;
+      }
+      case "move-layer": {
+        const [from, to] = forward ? [c.from, c.to] : [c.to, c.from];
+        list.splice(to, 0, ...list.splice(from, 1));
+        persist();
+        break;
+      }
+      case "rename-layer": {
+        const i = index(c.id);
+        const layer = list[i];
+        if (layer) list[i] = { ...layer, name: forward ? c.to : c.from };
+        persist();
+        break;
+      }
+      case "replace": {
+        const next = forward ? c.after : c.before;
+        persist({ kind: "wipe" });
+        for (const layer of next) for (const stroke of layer.strokes) persist({ kind: "put", layer: layer.id, stroke });
+        setLayers(next);
+        active.value = next.at(-1)?.id ?? "";
+        return;
+      }
+    }
+    setLayers(list);
+  }
+
+  function run(c: Command) {
+    if (!ready.value) return;
+    closeAfterFailedRetry = false;
+    apply(c, true);
+    done.value = [...done.value.slice(1 - HISTORY), c];
+    undone.value = [];
+  }
+
+  function undo() {
+    const c = done.value.at(-1);
+    if (!c) return;
+    apply(c, false);
+    done.value = done.value.slice(0, -1);
+    undone.value = [...undone.value, c];
+  }
+
+  function redo() {
+    const c = undone.value.at(-1);
+    if (!c) return;
+    apply(c, true);
+    undone.value = undone.value.slice(0, -1);
+    done.value = [...done.value, c];
+  }
+
+  /** A stroke number, unique in this drawing and above every earlier one. */
+  const nextSeq = () => seq++;
+
+  function addStroke(stroke: Stroke) {
+    const layer = activeLayer();
+    if (layer?.visible) run({ kind: "stroke", layer: layer.id, stroke });
+  }
+
+  function addLayer() {
+    let n = layers.value.length + 1;
+    while (layers.value.some((l) => l.id === `layer-${n}`)) n++;
+    run({ kind: "add-layer", layer: blank(n), index: index(active.value) + 1 });
+  }
+
+  function deleteLayer(id: string) {
+    const i = index(id);
+    const layer = layers.value[i];
+    if (layer && layers.value.length > 1) run({ kind: "delete-layer", layer, index: i });
+  }
+
+  function moveLayer(id: string, to: number) {
+    const from = index(id);
+    if (from >= 0 && to >= 0 && to < layers.value.length && to !== from) run({ kind: "move-layer", from, to });
+  }
+
+  function renameLayer(id: string, name: string) {
+    const layer = layers.value[index(id)];
+    const to = name.trim();
+    if (layer && to && to !== layer.name) run({ kind: "rename-layer", id, from: layer.name, to });
+  }
+
+  function toggleLayer(id: string) {
+    setLayers(layers.value.map((l) => (l.id === id ? { ...l, visible: !l.visible } : l)));
+    persist();
+  }
+
+  function selectLayer(id: string) {
+    if (index(id) < 0 || id === active.value) return;
+    active.value = id;
+    persist();
+  }
+
+  function replace(after: readonly Layer[]) {
+    run({ kind: "replace", before: layers.value, after });
+  }
+
+  function clear() {
+    if (strokeCount.value) replace(layers.value.map((l) => ({ ...l, strokes: [] })));
+  }
+
+  function closing(event: Event) {
+    if ((!pending && !documentChanged) || !db || closeAfterFailedRetry) return;
+    event.preventDefault();
+    void flush().then((ok) => {
+      if (ok && !documentChanged) appWindow.close();
+      else if (!ok) closeAfterFailedRetry = true;
+    });
+  }
+
+  async function load(database: IDBDatabase) {
+    const tx = database.transaction(["strokes", "document"]);
+    const [doc, rows] = await Promise.all([
+      request(tx.objectStore("document").get("current")),
+      request(tx.objectStore("strokes").getAll()),
+    ]);
+    if (!documentRecord(doc)) return;
+    const byLayer = new Map<string, Stroke[]>(doc.layers.map((l) => [l.id, []]));
+    let top = doc.seq;
+    for (const row of rows) {
+      if (!strokeRecord(row)) continue;
+      const { layer, ...stroke } = row;
+      byLayer.get(layer)?.push(stroke);
+      top = Math.max(top, stroke.seq + 1);
+    }
+    seq = top;
+    layers.value = doc.layers.map((l) => ({ ...l, strokes: byLayer.get(l.id)!.sort((a, b) => a.seq - b.seq) }));
+    active.value = doc.layers.some((l) => l.id === doc.active) ? doc.active : doc.layers[0]!.id;
+  }
+
+  onMounted(async () => {
+    try {
+      db = await openBook();
+      if (closed) {
+        db.close();
+        return;
+      }
+      await load(db);
+    } catch {
+      db?.close();
+      db = undefined;
+    } finally {
+      ready.value = true;
+    }
+  });
+
+  appWindow.addEventListener("close-requested", closing);
+  onBeforeUnmount(() => {
+    closed = true;
+    appWindow.removeEventListener("close-requested", closing);
+    void flush().finally(() => db?.close());
+  });
+
+  return {
+    layers,
+    active,
+    ready,
+    canUndo,
+    canRedo,
+    strokeCount,
+    nextSeq,
+    addStroke,
+    addLayer,
+    deleteLayer,
+    moveLayer,
+    renameLayer,
+    toggleLayer,
+    selectLayer,
+    replace,
+    clear,
+    undo,
+    redo,
+    flush,
+  };
+}
