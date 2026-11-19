@@ -1,6 +1,6 @@
 import type { DrawAction, DrawAtomic, DrawEvent, DrawRecording, DrawSnapshot, DrawUi } from "./events";
 import { LIMITS } from "./eventBinary";
-import { clamp, STRIDE, type Layer, type Stroke } from "./model";
+import { clamp, isTool, STRIDE, type Layer, type Stroke, type Tool } from "./model";
 import type { View } from "./renderer";
 
 export interface PlayerFrame extends DrawSnapshot {
@@ -8,6 +8,16 @@ export interface PlayerFrame extends DrawSnapshot {
   view: View;
   cursor: { x: number; y: number; width: number; tool: Stroke["tool"]; color: string } | null;
 }
+
+/** The editor controls a replay shows: the recorded tool state and the last drawing tool. */
+export interface EditorState {
+  at: number;
+  ui: DrawUi;
+  tool: Tool;
+}
+
+const EDITOR_FIELDS = ["mode", "shape", "color", "size", "active"] as const;
+type EditorField = (typeof EDITOR_FIELDS)[number];
 
 type Atomic = DrawAtomic | { kind: "restore-properties"; layer: Layer };
 type Mutation = Atomic | { kind: "group"; changes: readonly Atomic[]; active?: string };
@@ -234,6 +244,10 @@ function upperBound<T>(items: readonly T[], target: number, value: (v: T) => num
   return lo;
 }
 
+export function editorAt(track: readonly EditorState[], at: number): EditorState | null {
+  return track[upperBound(track, at, (s) => s.at) - 1] ?? null;
+}
+
 function span(s: Stroke) {
   return Math.max(0, (s.points.at(-1) ?? 0) - (s.points[STRIDE - 1] ?? 0));
 }
@@ -316,6 +330,56 @@ export class PlaybackTimeline {
 
   count(at: number) {
     return upperBound(this.file.events, at, (e) => e.at);
+  }
+
+  /**
+   * The editor state over the replay, per field: a value whose strokes were all undone is dropped
+   * unless `showUndone`, and so is one held for less than `hold` ms of `played` time.
+   */
+  editorTrack(showUndone: boolean, played: (raw: number) => number, hold: number): EditorState[] {
+    type Run = { at: number; value: DrawUi[EditorField]; drawn: boolean; visible: boolean };
+    const runs = new Map<EditorField, Run[]>(EDITOR_FIELDS.map((field) => [field, []]));
+    for (const [i, e] of this.file.events.entries()) {
+      if (e.kind === "ui") {
+        for (const [field, list] of runs) {
+          const value = e.state[field];
+          if (value !== undefined) list.push({ at: e.at, value, drawn: false, visible: false });
+        }
+      } else if (e.kind === "stroke") {
+        const visible = this.included(i, showUndone) !== undefined;
+        for (const list of runs.values()) {
+          const run = list.at(-1);
+          if (!run) continue;
+          run.drawn = true;
+          run.visible ||= visible;
+        }
+      }
+    }
+    const initial: DrawUi = {};
+    const changes: { at: number; field: EditorField; value: Run["value"] }[] = [];
+    for (const [field, list] of runs) {
+      const used = list.filter((run) => run.visible || !run.drawn);
+      let last: Run["value"];
+      for (const [i, run] of used.entries()) {
+        const end = used[i + 1]?.at ?? this.file.duration;
+        if (played(end) - played(run.at) < hold || run.value === last) continue;
+        if (last === undefined) Object.assign(initial, { [field]: run.value });
+        else changes.push({ at: run.at, field, value: run.value });
+        last = run.value;
+      }
+    }
+    changes.sort((a, b) => a.at - b.at);
+    let tool: Tool = isTool(initial.mode) ? initial.mode : "pen";
+    const track: EditorState[] = [{ at: -Infinity, ui: initial, tool }];
+    for (const change of changes) {
+      const previous = track.at(-1)!;
+      const ui: DrawUi = Object.assign({ ...previous.ui }, { [change.field]: change.value });
+      if (isTool(ui.mode)) tool = ui.mode;
+      const next = { at: change.at, ui, tool };
+      if (previous.at === change.at) track[track.length - 1] = next;
+      else track.push(next);
+    }
+    return track;
   }
 
   frame(at: number, showUndone: boolean, count = this.count(at)): PlayerFrame {

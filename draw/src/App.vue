@@ -92,7 +92,7 @@ const surface = useSurface({
 });
 const { error, angle, drawing, effective, selected, cursor, ready: drawable } = surface;
 const viewState = { zoom: surface.zoom, angle };
-const ink = computed(() => INK[dark.value ? "dark" : "light"]);
+const ink = computed(() => INK[(session.shown.value?.ui.dark ?? dark.value) ? "dark" : "light"]);
 const brushTool = computed<Tool>(() => {
   const m = effective.value;
   return isTool(m) ? m : mode.value === "shape" ? inkTool.value : lastTool.value;
@@ -137,7 +137,31 @@ const {
   author: recordAuthor,
   state: recordState,
 } = session;
-const { loaded: inPlayer, hideUi: cleanPlayer } = player;
+const { loaded: inPlayer, hideUi: cleanPlayer, editor: replayed } = player;
+const showcase = computed(() => inPlayer.value && player.chrome.value === "editor");
+const controls = computed(() => {
+  const ui = replayed.value?.ui;
+  const tool = replayed.value?.tool ?? brushTool.value;
+  if (!showcase.value || !ui)
+    return {
+      mode: effective.value,
+      shape: shape.value,
+      color: color.value,
+      tool: brushTool.value,
+      size: settings[brushTool.value].size,
+      opacity: settings[brushTool.value].opacity,
+      symmetry: symmetry.value !== null,
+    };
+  return {
+    mode: ui.mode ?? tool,
+    shape: ui.shape ?? shape.value,
+    color: isColor(ui.color) ? ui.color : "ink",
+    tool,
+    size: ui.size ?? settings[tool].size,
+    opacity: 1,
+    symmetry: !!ui.symmetry,
+  };
+});
 const recordingControlsBusy = computed(() => documentBusy.value || drawing.value || session.busy.value);
 const newRecording = ref(false);
 const draftTitle = ref("");
@@ -152,7 +176,9 @@ watch(open, (value) => {
   if (value !== "recording") newRecording.value = false;
 });
 Object.assign(window, { __draw: { open: session.open, play: player.play, seek: player.seek, pause: player.pause } });
-const hint = computed(() => ready.value && !error.value && strokeCount.value === 0 && !drawing.value);
+const hint = computed(
+  () => ready.value && !error.value && strokeCount.value === 0 && !drawing.value && !inPlayer.value,
+);
 const lastStroke = computed(() => layers.value.find((l) => l.id === active.value)?.strokes.at(-1)?.tool ?? "");
 const caption = computed(
   () => navigator.platform !== "MacIntel" && appWindow.chrome.titleBarStyle === "hidden" && !appWindow.isFullscreen(),
@@ -390,6 +416,11 @@ function outside(e: PointerEvent) {
 }
 
 function keydown(e: KeyboardEvent) {
+  if (showcase.value) {
+    if (e.key === "Escape" && !player.playing.value) player.exit();
+    e.preventDefault();
+    return;
+  }
   if (inPlayer.value) {
     if (e.key === "Escape") {
       if (cleanPlayer.value) cleanPlayer.value = false;
@@ -585,7 +616,7 @@ onBeforeUnmount(() => {
 <template>
   <main
     id="draw"
-    :class="{ dark: playFrame?.ui.dark ?? dark }"
+    :class="{ dark: playFrame?.ui.dark ?? dark, showcase }"
     :data-player="inPlayer"
     :data-recording="recordState"
     :aria-busy="documentBusy"
@@ -630,14 +661,14 @@ onBeforeUnmount(() => {
       style="display: none"
       @change="session.fileInput"
     />
-    <template v-if="!inPlayer">
+    <template v-if="!inPlayer || showcase">
       <header class="strip">
         <div class="cluster pill">
           <button
             id="undo"
             class="icon-button"
             aria-label="Undo"
-            :disabled="!canUndo || documentBusy"
+            :disabled="!showcase && (!canUndo || documentBusy)"
             @click="book.undo"
             @pointerenter="showTip($event, 'Undo  Ctrl+Z', true)"
             @focus="showTip($event, 'Undo  Ctrl+Z', true)"
@@ -650,7 +681,7 @@ onBeforeUnmount(() => {
             id="redo"
             class="icon-button"
             aria-label="Redo"
-            :disabled="!canRedo || documentBusy"
+            :disabled="showcase || !canRedo || documentBusy"
             @click="book.redo"
             @pointerenter="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
             @focus="showTip($event, 'Redo  Ctrl+Shift+Z', true)"
@@ -782,9 +813,9 @@ onBeforeUnmount(() => {
       </header>
 
       <ToolRail
-        :mode="effective"
-        :shape="shape"
-        :symmetry="symmetry !== null"
+        :mode="controls.mode"
+        :shape="controls.shape"
+        :symmetry="controls.symmetry"
         :open="open"
         @mode="setMode"
         @flyout="(which, e) => toggle(which, e)"
@@ -1102,12 +1133,12 @@ onBeforeUnmount(() => {
         </button>
       </div>
       <Toolbar
-        :tool="isTool(effective) ? effective : null"
-        :color="color"
+        :tool="isTool(controls.mode) ? controls.mode : null"
+        :color="controls.color"
         :ink="ink"
-        :brush-tool="brushTool"
-        :size="settings[brushTool].size"
-        :opacity="settings[brushTool].opacity"
+        :brush-tool="controls.tool"
+        :size="controls.size"
+        :opacity="controls.opacity"
         :open="open"
         @paint="(e) => toggle('paint', e)"
         @tool="setMode"
@@ -1117,7 +1148,7 @@ onBeforeUnmount(() => {
       />
 
       <Navigator
-        v-if="navigatorOn && drawable"
+        v-if="navigatorOn && drawable && !inPlayer"
         :version="navigatorVersion"
         :thumbnail="surface.thumbnail"
         :viewport="surface.viewport"
@@ -1141,14 +1172,14 @@ onBeforeUnmount(() => {
         :style="{
           left: playCursor.x + 'px',
           top: playCursor.y + 'px',
-          width: 2 * playCursor.r + 'px',
-          height: 2 * playCursor.r + 'px',
+          width: 2 * Math.max(playCursor.r, showcase ? 6 : 0) + 'px',
+          height: 2 * Math.max(playCursor.r, showcase ? 6 : 0) + 'px',
           borderColor: playCursor.color,
         }"
       >
-        <span v-if="!cleanPlayer">{{ TOOL_INFO[playCursor.label as Tool]?.name }}</span>
+        <span v-if="!cleanPlayer && !showcase">{{ TOOL_INFO[playCursor.label as Tool]?.name }}</span>
       </div>
-      <PlayerTransport v-if="!cleanPlayer" :player="player" />
+      <PlayerTransport v-if="!cleanPlayer && !showcase" :player="player" />
     </template>
     <p v-if="documentBusy || notice" class="notice pill" role="status">
       {{ documentBusy ? "Applying changes…" : notice }}

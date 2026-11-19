@@ -1,9 +1,9 @@
 import { nextTick, ref, shallowRef } from "vue";
 import { decodeRecording, type DrawRecording } from "./events";
 import { clamp, type Layer } from "./model";
-import { PlaybackTimeline, type PlayerFrame } from "./playbackTimeline";
+import { editorAt, PlaybackTimeline, type EditorState, type PlayerFrame } from "./playbackTimeline";
 
-export type { PlayerFrame } from "./playbackTimeline";
+export type { EditorState, PlayerFrame } from "./playbackTimeline";
 
 export interface PlayOptions {
   speed?: number;
@@ -12,7 +12,12 @@ export interface PlayOptions {
   camera?: "author" | "fit";
   hideUi?: boolean;
   showUndone?: boolean;
+  /** `editor`: show the editor's controls following the recorded tools instead of the player's, and ignore input. */
+  chrome?: "player" | "editor";
 }
+
+/** How long a recorded tool state must last in played time before the editor controls show it, ms. */
+const EDITOR_HOLD = 250;
 
 export interface DrawPlaybackApi {
   open(bytes: Uint8Array): Promise<{ duration: number; events: number }>;
@@ -44,9 +49,12 @@ export function createPlayer(output: Output) {
   const showUndone = ref(true);
   const camera = ref<"author" | "fit">("author");
   const hideUi = ref(false);
+  const chrome = ref<"player" | "editor">("player");
+  const editor = shallowRef<EditorState | null>(null);
   const density = shallowRef<number[]>([]);
   const finalLayers = shallowRef<readonly Layer[]>([]);
   let timeline: PlaybackTimeline | null = null;
+  let editorTrack: EditorState[] = [];
   let current: PlayerFrame | null = null;
   let raf = 0;
   let opening = 0;
@@ -70,6 +78,8 @@ export function createPlayer(output: Output) {
     position.value = at;
     count.value = event ?? timeline.count(at);
     current = timeline.frame(at, showUndone.value, count.value);
+    const state = chrome.value === "editor" ? editorAt(editorTrack, at) : null;
+    if (state !== editor.value) editor.value = state;
     output.present(!showCursor.value && current.cursor ? { ...current, cursor: null } : current);
   }
 
@@ -98,6 +108,8 @@ export function createPlayer(output: Output) {
     viewOnly.value = file.protected;
     title.value = file.meta.title || "Drawing replay";
     hideUi.value = false;
+    chrome.value = "player";
+    editorTrack = [];
     finalLayers.value = next.final.layers;
     density.value = next.density;
     display(0);
@@ -149,12 +161,22 @@ export function createPlayer(output: Output) {
     if (options.camera !== undefined) camera.value = options.camera;
     if (options.showUndone !== undefined) showUndone.value = options.showUndone;
     if (options.hideUi !== undefined) hideUi.value = options.hideUi;
+    if (options.chrome !== undefined) chrome.value = options.chrome;
   }
 
   async function play(options: PlayOptions = {}) {
     if (!timeline) throw new Error("Open a drawing recording first.");
     configure(options);
     stopClock();
+    const clock = timeline.clock(
+      compressPausesTo.value * 1000,
+      options.fitTo === undefined ? undefined : options.fitTo * 1000,
+    );
+    const rate = options.fitTo === undefined ? speed.value : 1;
+    editorTrack =
+      chrome.value === "editor"
+        ? timeline.editorTrack(showUndone.value, (raw) => clock.played(raw) / rate, EDITOR_HOLD)
+        : [];
     if (position.value >= duration.value || options.fitTo !== undefined) display(0);
     else display(position.value);
     if (!pending) {
@@ -167,11 +189,6 @@ export function createPlayer(output: Output) {
       pending = { promise, resolve, reject };
     }
     const result = pending.promise;
-    const clock = timeline.clock(
-      compressPausesTo.value * 1000,
-      options.fitTo === undefined ? undefined : options.fitTo * 1000,
-    );
-    const rate = options.fitTo === undefined ? speed.value : 1;
     if ((!duration.value && options.fitTo === undefined) || !Number.isFinite(rate) || !clock.duration) {
       display(duration.value);
       finish();
@@ -221,6 +238,9 @@ export function createPlayer(output: Output) {
     abandon();
     loaded.value = false;
     hideUi.value = false;
+    chrome.value = "player";
+    editor.value = null;
+    editorTrack = [];
     output.close(continueDrawing, current);
     current = null;
     timeline = null;
@@ -246,6 +266,8 @@ export function createPlayer(output: Output) {
     count,
     speed,
     hideUi,
+    chrome,
+    editor,
     camera,
     showCursor,
     showUndone,

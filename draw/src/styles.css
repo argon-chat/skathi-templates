@@ -529,6 +529,9 @@ kbd.shortcut {
   border: 1px solid #ffffff29;
   border-radius: 5px;
 }
+.showcase {
+  pointer-events: none;
+}
 .play-cursor {
   position: absolute;
   pointer-events: none;
