@@ -85,7 +85,7 @@ const listing = computed(() => {
         >
       </div>
       <p class="files">doom.bin {{ size(bench.imageBytes) }} at {{ hex(LOAD_ADDRESS, 6) }}</p>
-      <p class="files">doom1.wad {{ size(bench.wadBytes) }}</p>
+      <p class="files">{{ bench.wadName }} {{ size(bench.wadBytes) }}</p>
     </section>
 
     <section>

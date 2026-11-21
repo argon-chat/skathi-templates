@@ -25,6 +25,9 @@ The guest reads `assets/doom1.wad`, the shareware episode of Doom 1.9. It is not
 [doom-wad-shareware](https://packages.debian.org/stable/doom-wad-shareware) source package and checks its
 SHA-256. `bun run wad` fetches it again, and any other `doom1.wad` you put there is used as it is.
 
+[Freedoom](https://freedoom.github.io/) is the free alternative: with no `doom1.wad`, the workbench runs
+`assets/freedoom1.wad` (Freedoom: Phase 1, BSD-3-Clause), which you may ship in any app.
+
 id Software lets the shareware WAD be given away free of charge. It may not be sold or changed, so an app you
 charge for cannot include it: ship your own guest and data, or let the user supply the WAD.
 

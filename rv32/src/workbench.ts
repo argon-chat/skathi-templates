@@ -2,7 +2,7 @@
 // and what the panels show of it.
 
 import { reactive, shallowRef, triggerRef } from "vue";
-import { HEIGHT, Machine, WIDTH } from "./rv32/machine";
+import { HEIGHT, Machine, WADS, WIDTH } from "./rv32/machine";
 
 const SLICE = 500_000;
 /** How long a display frame may run instructions before it lets the window draw. */
@@ -26,6 +26,7 @@ export const bench = reactive({
   fps: 0,
   mips: 0,
   imageBytes: 0,
+  wadName: "",
   wadBytes: 0,
   /** The demo is being played as fast as the emulator goes. */
   timing: false,
@@ -38,7 +39,7 @@ export const frame = shallowRef(0);
 export const before = new Int32Array(32);
 export const stepped = shallowRef(false);
 
-let files: { image: Uint8Array; wad: Uint8Array } | null = null;
+let files: { image: Uint8Array; wad: Uint8Array; wadName: string } | null = null;
 let active: Machine | null = null;
 let context: CanvasRenderingContext2D | null = null;
 let picture: ImageData | null = null;
@@ -89,12 +90,22 @@ async function bytes(path: string): Promise<Uint8Array> {
 export async function load(): Promise<void> {
   try {
     const image = await bytes("assets/doom.bin");
-    const wad = await bytes("assets/doom1.wad").catch(() => null);
+    let wad: Uint8Array | null = null;
+    let wadName = "";
+    for (const name of WADS) {
+      wad = await bytes(`assets/${name}`).catch(() => null);
+      if (wad) {
+        wadName = name;
+        break;
+      }
+    }
     if (!wad) {
-      bench.error = "assets/doom1.wad is missing. Run `bun run wad` to fetch the shareware episode, then start again.";
+      bench.error =
+        "No game data in assets/. Run `bun run wad` to fetch doom1.wad, the shareware episode, or put freedoom1.wad there.";
       return;
     }
-    files = { image, wad };
+    files = { image, wad, wadName };
+    bench.wadName = wadName;
     bench.imageBytes = image.length;
     bench.wadBytes = wad.length;
     bench.loaded = true;

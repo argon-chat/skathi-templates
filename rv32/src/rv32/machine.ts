@@ -7,7 +7,8 @@ export const WIDTH = 320;
 export const HEIGHT = 200;
 export const LOAD_ADDRESS = 0x10000;
 export const MEMORY_SIZE = 16 * 1024 * 1024;
-export const WAD_NAME = "doom1.wad";
+/** The game data the engine knows by name, in the order the bench looks for it in assets/. */
+export const WADS = ["doom1.wad", "freedoom1.wad"] as const;
 const LOG_LINES = 200;
 const EMPTY = new Uint8Array(0);
 
@@ -27,6 +28,8 @@ const enum Call {
 export interface MachineOptions {
   image: Uint8Array;
   wad: Uint8Array;
+  /** The WAD's file name: the engine tells the games apart by it. */
+  wadName: string;
   /** The engine's command line after the program name. */
   args?: string[];
   /** The guest's clock, in milliseconds. */
@@ -53,8 +56,8 @@ export class Machine {
   private readonly now: () => number;
 
   constructor(options: MachineOptions) {
-    this.files = [{ name: WAD_NAME, data: options.wad }];
-    this.args = ["doom", "-iwad", WAD_NAME, ...(options.args ?? [])];
+    this.files = [{ name: options.wadName, data: options.wad }];
+    this.args = ["doom", "-iwad", options.wadName, ...(options.args ?? [])];
     this.now = options.now ?? (() => performance.now());
     this.cpu = new Rv32(MEMORY_SIZE, LOAD_ADDRESS + options.image.length, () => this.hostCall());
     this.cpu.u8.set(options.image, LOAD_ADDRESS);
