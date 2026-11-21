@@ -2,7 +2,7 @@
 // No click handlers: `--window-control` makes each button the OS caption button, so Windows
 // performs the action (and shows snap layouts over maximize) and the other hosts act on mouse-up.
 import { computed } from "vue";
-import { appWindow } from "@skathi-native/runtime";
+import { appWindow } from "skathi:app";
 import { hideTip, showTip } from "../tooltip";
 import Icon from "./Icon.vue";
 

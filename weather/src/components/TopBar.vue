@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // sk.config.json hides the OS title bar: this strip drags the window (`window-drag: move`), and when the
 // host draws no caption buttons of its own, `--window-control` gives these their OS behaviour.
-import { appWindow } from "@skathi-native/runtime";
+import { appWindow } from "skathi:app";
 import { onMounted, onUnmounted, ref } from "vue";
 import { app } from "../state";
 import Glass from "./Glass.vue";

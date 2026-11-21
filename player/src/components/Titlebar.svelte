@@ -1,7 +1,7 @@
 <script lang="ts">
   // `window-drag: move` drags the window; `--window-control` gives each button its OS behaviour
   // (snap layouts on maximize).
-  import { appWindow } from "@skathi-native/runtime";
+  import { appWindow } from "skathi:app";
   import { onMount } from "svelte";
   import { productName } from "../lib/product";
 

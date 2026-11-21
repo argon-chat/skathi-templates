@@ -1,5 +1,5 @@
 import { computed, onBeforeUnmount, onMounted, ref, shallowRef } from "vue";
-import { appWindow } from "@skathi-native/runtime";
+import { appWindow } from "skathi:app";
 import type { DrawAtomic, DrawMutation } from "./events";
 import type { JournalEdit } from "./recordingChanges";
 import { canonicalStroke, fraction16 } from "./precision";

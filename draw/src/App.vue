@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from "vue";
-import { appWindow } from "@skathi-native/runtime";
+import { appWindow } from "skathi:app";
 import { useRecordingSession } from "./recordingSession";
 import type { DrawUi } from "./events";
 import PlayerTransport from "./components/PlayerTransport.vue";
