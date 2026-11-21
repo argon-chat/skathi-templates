@@ -1,0 +1,147 @@
+:root {
+  --back: #0f1412;
+  --panel: #151c19;
+  --raised: #1d2622;
+  --hover: #26322d;
+  --line: #2c3a34;
+  --text: #d5e4dc;
+  --muted: #7d9388;
+  --accent: #7be3a0;
+  --warn: #e8c46a;
+  --danger: #ef6f6c;
+  --ink: #08110c;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background-color: var(--back);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  color: var(--text);
+  font-family: "Cascadia Mono", Consolas, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  user-select: none;
+}
+.app.dragging {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--line);
+  background-color: var(--panel);
+}
+.control {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background-color: var(--raised);
+  color: var(--text);
+  font: inherit;
+  transition: background-color 80ms;
+}
+.control:hover {
+  background-color: var(--hover);
+}
+.control.primary,
+.control.on {
+  border-color: var(--accent);
+  background-color: var(--accent);
+  color: var(--ink);
+}
+.programs {
+  display: flex;
+  gap: 4px;
+  margin-right: 8px;
+}
+.speed {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 8px;
+  color: var(--muted);
+}
+.speed.off {
+  opacity: 0.4;
+}
+.speed input {
+  width: 110px;
+  accent-color: var(--accent);
+}
+.speed span {
+  width: 64px;
+  color: var(--text);
+}
+.readout {
+  margin-left: auto;
+  color: var(--muted);
+}
+.readout b {
+  margin-right: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: var(--raised);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 340px;
+  gap: 18px;
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+  overflow: auto;
+}
+.left {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+}
+.bezel {
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background-color: #060a08;
+}
+.note {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0;
+  color: var(--text);
+}
+.note span {
+  color: var(--muted);
+}
+.note.error {
+  color: var(--danger);
+}
+
+/* The listing and the panels arrive one after another when the window opens. */
+.debugger > * {
+  transition:
+    opacity 240ms,
+    translate 240ms;
+  transition-delay: calc(sibling-index() * 40ms);
+}
+@starting-style {
+  .debugger > * {
+    opacity: 0;
+    translate: 0 8px;
+  }
+}
