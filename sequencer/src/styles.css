@@ -1,0 +1,36 @@
+:root {
+  --back: #0f0d0c;
+  --well: #1b1714;
+  --raised: #25201c;
+  --hover: #302a25;
+  --line: #3a332d;
+  --text: #f1e7dc;
+  --muted: #9c8f82;
+  --accent: #ffb45c;
+  --danger: #ef6f6c;
+  --ink: #1c1206;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background-color: var(--back);
+  color: var(--text);
+  font-family: system-ui, sans-serif;
+  font-size: 13px;
+  user-select: none;
+}
+
+/* What a pen, a trackpad or a mouse with a motor feels on Play: two ticks. */
+@haptic-pattern --start {
+  fallback: tick;
+  0ms {
+    intensity: 0.3;
+    sharpness: 0.6;
+  }
+  70ms {
+    intensity: 0.65;
+    sharpness: 0.9;
+  }
+}
