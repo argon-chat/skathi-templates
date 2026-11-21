@@ -1,0 +1,153 @@
+:root {
+  --back: #111214;
+  --panel: #17191c;
+  --raised: #202328;
+  --hover: #2a2e35;
+  --line: #2e333b;
+  --text: #dcdfe4;
+  --muted: #858c98;
+  --accent: #f2b33d;
+  --warn: #e8c46a;
+  --danger: #d9534f;
+  --ink: #15110a;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background-color: var(--back);
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  color: var(--text);
+  font-family: "Cascadia Mono", Consolas, "SF Mono", Menlo, "DejaVu Sans Mono", monospace;
+  font-size: 13px;
+  line-height: 1.4;
+  user-select: none;
+}
+
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px 10px;
+  border-bottom: 1px solid var(--line);
+  background-color: var(--panel);
+}
+.control {
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background-color: var(--raised);
+  color: var(--text);
+  font: inherit;
+  white-space: nowrap;
+  transition: background-color 80ms;
+}
+.control:hover {
+  background-color: var(--hover);
+}
+.control:disabled {
+  opacity: 0.4;
+}
+.control.primary,
+.control.on {
+  border-color: var(--accent);
+  background-color: var(--accent);
+  color: var(--ink);
+}
+.control.primary {
+  width: 76px;
+}
+.readout {
+  margin-left: auto;
+  color: var(--muted);
+}
+.readout b {
+  margin-right: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background-color: var(--raised);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 372px;
+  grid-template-rows: minmax(0, 1fr);
+  gap: 18px;
+  flex: 1;
+  min-height: 0;
+  padding: 16px;
+  overflow: auto;
+}
+.left {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  color: var(--muted);
+}
+.binding b {
+  margin-right: 6px;
+  padding: 1px 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background-color: var(--raised);
+  color: var(--text);
+  font-weight: 400;
+}
+
+.console {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 52px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  background-color: var(--panel);
+}
+/* The guest's output, newest line at the bottom: what does not fit fades out at the top. */
+.lines {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+  mask-image: linear-gradient(transparent, #000 22px);
+}
+.console pre {
+  margin: 0;
+  color: var(--muted);
+  font: inherit;
+  font-size: 12px;
+  white-space: pre;
+}
+
+/* The panels arrive one after another when the window opens. */
+.inspector > * {
+  transition:
+    opacity 240ms,
+    translate 240ms;
+  transition-delay: calc(sibling-index() * 40ms);
+}
+@starting-style {
+  .inspector > * {
+    opacity: 0;
+    translate: 0 8px;
+  }
+}

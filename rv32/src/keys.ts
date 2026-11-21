@@ -1,0 +1,40 @@
+// The keyboard, as the engine names it: `KeyboardEvent.code` to the engine's key code.
+
+export const KEYS: Record<string, number> = {
+  ArrowRight: 0xae,
+  ArrowLeft: 0xac,
+  ArrowUp: 0xad,
+  ArrowDown: 0xaf,
+  ControlLeft: 0xa3,
+  ControlRight: 0xa3,
+  Space: 0xa2,
+  ShiftLeft: 0xb6,
+  ShiftRight: 0xb6,
+  AltLeft: 0xb8,
+  AltRight: 0xb8,
+  Enter: 13,
+  Escape: 27,
+  Tab: 9,
+  KeyY: 0x79,
+  KeyN: 0x6e,
+  Digit1: 0x31,
+  Digit2: 0x32,
+  Digit3: 0x33,
+  Digit4: 0x34,
+  Digit5: 0x35,
+  Digit6: 0x36,
+  Digit7: 0x37,
+};
+
+export const LEGEND = [
+  { keys: "↑ ↓", does: "walk" },
+  { keys: "← →", does: "turn" },
+  { keys: "Alt", does: "strafe" },
+  { keys: "Shift", does: "run" },
+  { keys: "Ctrl", does: "fire" },
+  { keys: "Space", does: "open" },
+  { keys: "1–7", does: "weapon" },
+  { keys: "Tab", does: "map" },
+  { keys: "Enter", does: "choose" },
+  { keys: "Esc", does: "menu" },
+];
